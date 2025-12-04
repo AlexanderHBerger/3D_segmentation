@@ -1,0 +1,22 @@
+program: sweep_train.py
+method: random
+metric:
+  name: val/dice_mean
+  goal: maximize
+parameters:
+  learning_rate:
+    distribution: log_uniform_values
+    min: 0.001
+    max: 0.01
+  weight_decay:
+    distribution: log_uniform_values
+    min: 1e-6
+    max: 8e-5
+  momentum:
+    distribution: uniform
+    min: 0.95
+    max: 0.999
+  tversky_beta:
+    distribution: categorical
+    values: [0.3, 0.4, 0.6, 0.7]
+run_cap: 10
