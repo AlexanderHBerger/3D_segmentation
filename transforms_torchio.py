@@ -28,6 +28,7 @@ import torch
 import numpy as np
 from typing import Optional, Tuple
 from math import sqrt
+import time
 
 
 # Picklable transform classes for multiprocessing compatibility
@@ -70,7 +71,8 @@ class RotationScalingTransform:
             label_interpolation='nearest',
             default_pad_value='mean',  # Use 0 for images (background value)
             default_pad_label=-1,  # Use -1 for labels (ignore)
-            p=1.0
+            p=1.0,
+            copy=False
         )
         
         return transform(subject)
@@ -257,16 +259,15 @@ class OversizedCrop:
         current_shape_whd = np.array(subject['image'].shape[1:])  # (W, H, D)
 
         target_shape_whd = np.array(self.target_size)  # (W, H, D)
-
-        # Check if volume is smaller than target in any dimension
-        needs_padding = np.any(current_shape_whd < target_shape_whd)
         
         # For small volumes: use CropOrPad (center crop/pad)
-        if needs_padding:
+        if np.any(current_shape_whd < target_shape_whd):
             transform = tio.CropOrPad(
                 target_shape=tuple(target_shape_whd.tolist()),
-                padding_mode=self.padding_mode
+                padding_mode=self.padding_mode,
+                copy=False
             )
+            print("Using CropOrPad for small volume.", flush=True)
             return transform(subject)
         
         # For large volumes: random crop
@@ -275,7 +276,7 @@ class OversizedCrop:
             self.foreground_oversample_percent > 0 and
             np.random.random() < self.foreground_oversample_percent
         )
-        
+
         if use_foreground:
             # Sample from foreground
             start_w, start_h, start_d  = self._sample_foreground_crop(subject, current_shape_whd, target_shape_whd)
@@ -303,21 +304,20 @@ class OversizedCrop:
         h_fin = max(0, h_fin)
         d_ini = max(0, d_ini)
         d_fin = max(0, d_fin)
-        
-        transform = tio.Crop(
-            cropping=(w_ini, w_fin, h_ini, h_fin, d_ini, d_fin),
-            copy=False
-        )
 
-        res = transform(subject)
+        # Apply crop
+        new_subject = {}
+        new_subject["image"] = subject['image'][w_ini:w_ini + target_shape_whd[0], h_ini:h_ini + target_shape_whd[1], d_ini:d_ini + target_shape_whd[2]]
+        new_subject["label"] = subject['label'][w_ini:w_ini + target_shape_whd[0], h_ini:h_ini + target_shape_whd[1], d_ini:d_ini + target_shape_whd[2]]
+    
+        new_subject["case_id"] = subject['case_id']
+        if 'foreground_coords' in subject:
+                new_subject['foreground_coords'] = subject['foreground_coords']
 
-        # Verify the crop worked correctly
-        expected_shape = (1, target_shape_whd[0], target_shape_whd[1], target_shape_whd[2])
-        actual_shape = res['image'].shape
-        if actual_shape != expected_shape:
-            print(f"WARNING: OversizeCrop produced wrong shape! Expected {expected_shape}, got {actual_shape}")
+        new_subject = tio.Subject(**new_subject)
+        del subject  # Free memory
 
-        return res
+        return new_subject
 
     def _sample_uniform_crop(self, volume_shape: np.ndarray, target_shape: np.ndarray) -> np.ndarray:
         """
@@ -358,12 +358,18 @@ class OversizedCrop:
         Returns:
             Crop coordinates [w_start, h_start, d_start] in (W, H, D) ordering
         """
-        # Get label data
-        label = subject['label'].data  # (C, W, H, D)
-        
-        # Find all foreground voxel coordinates
-        foreground_mask = label[0] > 0  # Remove channel dimension
-        foreground_coords = torch.nonzero(foreground_mask, as_tuple=False).numpy()
+        # Check if precomputed foreground coordinates are available
+        if 'foreground_coords' in subject:
+            print("Using precomputed foreground coordinates for sampling.", flush=True)
+            foreground_coords = subject['foreground_coords']
+        else:
+            print("Computing foreground coordinates for sampling.", flush=True)
+            # Get label data
+            label = subject['label'].data  # (C, W, H, D)
+            
+            # Find all foreground voxel coordinates
+            foreground_mask = label[0] > 0  # Remove channel dimension
+            foreground_coords = torch.nonzero(foreground_mask, as_tuple=False).numpy()
         
         if len(foreground_coords) == 0:
             # No foreground, fall back to uniform sampling
@@ -418,13 +424,13 @@ def get_training_transforms(config, oversize_factor: float = 1.25) -> tio.Compos
     # 0. Oversize-Crop strategy (before augmentation to reduce border artifacts)
     # This handles both padding for small volumes and random cropping for large ones
     oversized_patch_size = tuple(int(s * oversize_factor) for s in config.data.patch_size)
-    transforms.append(
-        OversizedCrop(
-            target_size=oversized_patch_size,
-            foreground_oversample_percent=config.training.oversample_foreground_percent,
-            padding_mode='minimum'
-        )
-    )
+    # transforms.append(
+    #     OversizedCrop(
+    #         target_size=oversized_patch_size,
+    #         foreground_oversample_percent=config.training.oversample_foreground_percent,
+    #         padding_mode='minimum'
+    #     )
+    # )
     
     # ===== SPATIAL TRANSFORMS =====
     
@@ -453,7 +459,8 @@ def get_training_transforms(config, oversize_factor: float = 1.25) -> tio.Compos
                 max_displacement=config.augmentation.elastic_deform_sigma[1] / 10,
                 image_interpolation='linear',
                 label_interpolation='nearest',
-                p=config.augmentation.elastic_deform_prob
+                p=config.augmentation.elastic_deform_prob,
+                copy=False
             )
         )
     
@@ -466,7 +473,8 @@ def get_training_transforms(config, oversize_factor: float = 1.25) -> tio.Compos
                 mean=0,
                 std=(sqrt(config.augmentation.gaussian_noise_variance[0]), 
                      sqrt(config.augmentation.gaussian_noise_variance[1])),
-                p=config.augmentation.gaussian_noise_prob
+                p=config.augmentation.gaussian_noise_prob,
+                copy=False
             )
         )
     
@@ -475,7 +483,8 @@ def get_training_transforms(config, oversize_factor: float = 1.25) -> tio.Compos
         transforms.append(
             tio.RandomBlur(
                 std=config.augmentation.gaussian_blur_sigma,
-                p=config.augmentation.gaussian_blur_prob
+                p=config.augmentation.gaussian_blur_prob,
+                copy=False
             )
         )
     
@@ -486,7 +495,8 @@ def get_training_transforms(config, oversize_factor: float = 1.25) -> tio.Compos
             tio.Lambda(
                 brightness,
                 p=config.augmentation.brightness_prob,
-                include=['image']
+                include=['image'],
+                copy=False
             )
         )
     
@@ -500,7 +510,8 @@ def get_training_transforms(config, oversize_factor: float = 1.25) -> tio.Compos
             tio.Lambda(
                 contrast,
                 p=config.augmentation.contrast_prob,
-                include=['image']
+                include=['image'],
+                copy=False
             )
         )
     
@@ -514,7 +525,8 @@ def get_training_transforms(config, oversize_factor: float = 1.25) -> tio.Compos
                 axes=(0, 1, 2),
                 downsampling=(downsampling_min, downsampling_max),
                 image_interpolation='linear',
-                p=config.augmentation.simulate_low_res_prob
+                p=config.augmentation.simulate_low_res_prob,
+                copy=False
             )
         )
     
@@ -530,7 +542,8 @@ def get_training_transforms(config, oversize_factor: float = 1.25) -> tio.Compos
             tio.Lambda(
                 gamma_with_invert,
                 p=config.augmentation.gamma_prob,
-                include=['image']
+                include=['image'],
+                copy=False
             )
         )
     
@@ -546,7 +559,8 @@ def get_training_transforms(config, oversize_factor: float = 1.25) -> tio.Compos
             tio.Lambda(
                 gamma_no_invert,
                 p=config.augmentation.gamma_no_invert_prob,
-                include=['image']
+                include=['image'],
+                copy=False
             )
         )
     
@@ -555,7 +569,8 @@ def get_training_transforms(config, oversize_factor: float = 1.25) -> tio.Compos
         transforms.append(
             tio.RandomFlip(
                 axes=config.augmentation.mirror_axes,
-                flip_probability=config.augmentation.mirror_prob
+                flip_probability=config.augmentation.mirror_prob,
+                copy=False
             )
         )
     
