@@ -19,12 +19,32 @@ import numpy as np
 import pandas as pd
 import torch
 import nibabel as nib
+from scipy.ndimage import label as scipy_label
 
 # Import calibration metrics from training module
 from metrics import compute_calibration_metrics, prepare_targets_with_mask
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
+
+# =============================================================================
+# Lesion Size Bin Definitions (based on analysis of KiTS test set)
+# Boundaries defined by 20th, 40th, 60th, 80th percentiles of lesion volumes
+# =============================================================================
+LESION_SIZE_BINS = {
+    'very_small': (0, 10.125),           # 0-20th percentile: <10 mm³
+    'small': (10.125, 4346.325),         # 20-40th percentile: 10-4346 mm³
+    'medium': (4346.325, 15913.125),     # 40-60th percentile: 4346-15913 mm³
+    'large': (15913.125, 63595.8),       # 60-80th percentile: 15913-63596 mm³
+    'very_large': (63595.8, float('inf')) # 80-100th percentile: >63596 mm³
+}
+
+def get_lesion_size_bin(volume_mm3: float) -> str:
+    """Get the size bin for a lesion based on its volume in mm³."""
+    for bin_name, (lower, upper) in LESION_SIZE_BINS.items():
+        if lower <= volume_mm3 < upper:
+            return bin_name
+    return 'very_large'  # Catch-all for edge cases
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -245,6 +265,284 @@ def binary_erosion_3d(mask: np.ndarray) -> np.ndarray:
 
 
 # =============================================================================
+# Lesion-wise Metric Functions
+# =============================================================================
+
+def compute_lesion_wise_metrics(
+    label_data: np.ndarray,
+    pred_data: np.ndarray,
+    logits_data: Optional[np.ndarray],
+    valid_mask: np.ndarray,
+    spacing: Tuple[float, float, float],
+    num_bins: int = 15
+) -> List[Dict]:
+    """
+    Compute metrics for each individual lesion in the label.
+    
+    Uses connected component analysis on the label to identify lesions.
+    For each lesion, computes detection and calibration metrics only on
+    the foreground voxels of that lesion in the label (ignores false positives).
+    
+    Args:
+        label_data: Ground truth label array
+        pred_data: Binary prediction array (can contain -1 for invalid regions)
+        logits_data: Logits array (X, Y, Z, C) or None
+        valid_mask: Mask for valid pixels
+        spacing: Voxel spacing in mm
+        num_bins: Number of bins for calibration metrics
+        
+    Returns:
+        List of dictionaries, one per lesion with metrics
+    """
+    voxel_volume = np.prod(spacing)
+    
+    # Create binary mask of lesions in label
+    label_binary = (label_data > 0).astype(np.uint8)
+    
+    # Connected component analysis on label
+    labeled_array, num_lesions = scipy_label(label_binary)
+    
+    if num_lesions == 0:
+        return []
+    
+    lesion_metrics = []
+    
+    for lesion_id in range(1, num_lesions + 1):
+        # Get mask for this specific lesion
+        lesion_mask = (labeled_array == lesion_id)
+        lesion_size_voxels = lesion_mask.sum()
+        lesion_volume_mm3 = float(lesion_size_voxels * voxel_volume)
+        size_bin = get_lesion_size_bin(lesion_volume_mm3)
+        
+        # Get the intersection of lesion mask with valid region
+        lesion_valid_mask = lesion_mask & valid_mask
+        num_valid_voxels = lesion_valid_mask.sum()
+        
+        if num_valid_voxels == 0:
+            # Entire lesion is outside valid region
+            continue
+        
+        # Create binary prediction only within this lesion's valid region
+        pred_binary_on_lesion = (pred_data > 0) & lesion_valid_mask
+        
+        # Detection: proportion of lesion voxels that were correctly predicted as foreground
+        num_detected_voxels = pred_binary_on_lesion.sum()
+        detection_rate = float(num_detected_voxels) / float(num_valid_voxels)
+        
+        # Is the lesion detected at all (at least one voxel predicted as foreground)?
+        is_detected = int(num_detected_voxels > 0)
+        
+        metrics = {
+            'lesion_id': lesion_id,
+            'lesion_volume_mm3': lesion_volume_mm3,
+            'lesion_size_voxels': int(lesion_size_voxels),
+            'size_bin': size_bin,
+            'num_valid_voxels': int(num_valid_voxels),
+            'num_detected_voxels': int(num_detected_voxels),
+            'detection_rate': detection_rate,
+            'is_detected': is_detected
+        }
+        
+        # Compute calibration metrics if logits are available
+        if logits_data is not None and num_valid_voxels > 0:
+            try:
+                cal_metrics = compute_lesion_calibration_metrics(
+                    logits_data, label_data, lesion_valid_mask, num_bins
+                )
+                metrics.update(cal_metrics)
+            except Exception as e:
+                metrics['ece'] = np.nan
+                metrics['mce'] = np.nan
+                metrics['nll'] = np.nan
+                metrics['brier_score'] = np.nan
+        else:
+            metrics['ece'] = np.nan
+            metrics['mce'] = np.nan
+            metrics['nll'] = np.nan
+            metrics['brier_score'] = np.nan
+        
+        lesion_metrics.append(metrics)
+    
+    return lesion_metrics
+
+
+def compute_lesion_calibration_metrics(
+    logits_data: np.ndarray,
+    label_data: np.ndarray,
+    lesion_mask: np.ndarray,
+    num_bins: int = 15
+) -> Dict[str, float]:
+    """
+    Compute calibration metrics for a single lesion region.
+    
+    Args:
+        logits_data: Logits array (X, Y, Z, C) format
+        label_data: Ground truth label array
+        lesion_mask: Binary mask for this lesion's valid region
+        num_bins: Number of bins for ECE/MCE
+        
+    Returns:
+        Dictionary with ece, mce, nll, brier_score
+    """
+    import torch.nn.functional as F
+    
+    # Get the logits and labels only within the lesion mask
+    # logits_data is (X, Y, Z, C), so we need indices where lesion_mask is True
+    lesion_indices = np.where(lesion_mask)
+    
+    # Extract logits for lesion voxels: (N, C) where N is number of lesion voxels
+    logits_lesion = logits_data[lesion_indices]  # Shape: (N, C)
+    labels_lesion = label_data[lesion_indices]   # Shape: (N,)
+    
+    num_voxels = logits_lesion.shape[0]
+    if num_voxels == 0:
+        return {'ece': np.nan, 'mce': np.nan, 'nll': np.nan, 'brier_score': np.nan}
+    
+    num_classes = logits_lesion.shape[1]
+    
+    # Convert to torch tensors
+    logits_torch = torch.from_numpy(logits_lesion).float()  # (N, C)
+    labels_torch = torch.from_numpy(labels_lesion).long()   # (N,)
+    
+    # Clamp labels to valid range
+    labels_clamped = torch.clamp(labels_torch, 0, num_classes - 1)
+    
+    # Compute probabilities
+    probs = F.softmax(logits_torch, dim=1)  # (N, C)
+    
+    # Get predicted class and confidence
+    confidences, predictions = torch.max(probs, dim=1)
+    accuracies = predictions.eq(labels_clamped).float()
+    
+    # 1. ECE
+    from metrics import compute_ece, compute_mce
+    ece = compute_ece(confidences, accuracies, num_bins).item()
+    
+    # 2. MCE
+    mce = compute_mce(confidences, accuracies, num_bins).item()
+    
+    # 3. NLL (cross entropy)
+    nll = F.cross_entropy(logits_torch, labels_clamped, reduction='mean').item()
+    
+    # 4. Brier Score
+    labels_onehot = F.one_hot(labels_clamped, num_classes=num_classes).float()  # (N, C)
+    brier_score = ((probs - labels_onehot) ** 2).sum() / num_voxels
+    brier_score = brier_score.item()
+    
+    return {
+        'ece': ece,
+        'mce': mce,
+        'nll': nll,
+        'brier_score': brier_score
+    }
+
+
+def aggregate_lesion_metrics_by_size(lesion_metrics: List[Dict]) -> Dict:
+    """
+    Aggregate lesion-wise metrics by size bin.
+    
+    Args:
+        lesion_metrics: List of per-lesion metric dictionaries
+        
+    Returns:
+        Dictionary with aggregated statistics per size bin
+    """
+    if not lesion_metrics:
+        return {}
+    
+    # Group metrics by size bin
+    bins = {bin_name: [] for bin_name in LESION_SIZE_BINS.keys()}
+    
+    for metrics in lesion_metrics:
+        size_bin = metrics['size_bin']
+        if size_bin in bins:
+            bins[size_bin].append(metrics)
+    
+    aggregated = {}
+    
+    # Metrics to aggregate
+    metric_names = ['detection_rate', 'ece', 'mce', 'nll', 'brier_score']
+    
+    for bin_name, bin_metrics in bins.items():
+        if not bin_metrics:
+            aggregated[bin_name] = {
+                'count': 0,
+                'detection_count': 0,
+                'detection_rate': np.nan,
+            }
+            for m in metric_names:
+                aggregated[bin_name][m] = {'mean': np.nan, 'std': np.nan, 'median': np.nan}
+            continue
+        
+        # Count statistics
+        num_lesions = len(bin_metrics)
+        num_detected = sum(m['is_detected'] for m in bin_metrics)
+        
+        aggregated[bin_name] = {
+            'count': num_lesions,
+            'detection_count': num_detected,
+            'detection_rate_overall': num_detected / num_lesions if num_lesions > 0 else np.nan,
+        }
+        
+        # Aggregate each metric
+        for metric_name in metric_names:
+            values = [m[metric_name] for m in bin_metrics if not np.isnan(m.get(metric_name, np.nan))]
+            if values:
+                aggregated[bin_name][metric_name] = {
+                    'mean': float(np.mean(values)),
+                    'std': float(np.std(values)),
+                    'median': float(np.median(values)),
+                    'min': float(np.min(values)),
+                    'max': float(np.max(values)),
+                    'count': len(values)
+                }
+            else:
+                aggregated[bin_name][metric_name] = {
+                    'mean': np.nan, 'std': np.nan, 'median': np.nan,
+                    'min': np.nan, 'max': np.nan, 'count': 0
+                }
+        
+        # Add volume statistics for the bin
+        volumes = [m['lesion_volume_mm3'] for m in bin_metrics]
+        aggregated[bin_name]['volume_mm3'] = {
+            'mean': float(np.mean(volumes)),
+            'std': float(np.std(volumes)),
+            'min': float(np.min(volumes)),
+            'max': float(np.max(volumes))
+        }
+    
+    # Add overall statistics across all bins
+    all_metrics = lesion_metrics
+    num_total = len(all_metrics)
+    num_detected_total = sum(m['is_detected'] for m in all_metrics)
+    
+    aggregated['overall'] = {
+        'count': num_total,
+        'detection_count': num_detected_total,
+        'detection_rate_overall': num_detected_total / num_total if num_total > 0 else np.nan,
+    }
+    
+    for metric_name in metric_names:
+        values = [m[metric_name] for m in all_metrics if not np.isnan(m.get(metric_name, np.nan))]
+        if values:
+            aggregated['overall'][metric_name] = {
+                'mean': float(np.mean(values)),
+                'std': float(np.std(values)),
+                'median': float(np.median(values)),
+                'min': float(np.min(values)),
+                'max': float(np.max(values)),
+                'count': len(values)
+            }
+        else:
+            aggregated['overall'][metric_name] = {
+                'mean': np.nan, 'std': np.nan, 'median': np.nan,
+                'min': np.nan, 'max': np.nan, 'count': 0
+            }
+    
+    return aggregated
+
+
+# =============================================================================
 # File Loading Utilities
 # =============================================================================
 
@@ -310,8 +608,9 @@ def evaluate_sample(
     pred_path: Path,
     label_path: Path,
     pred_folder: Path,
-    num_bins: int = 15
-) -> Dict[str, float]:
+    num_bins: int = 15,
+    compute_lesion_wise: bool = False
+) -> Dict:
     """
     Evaluate a single sample.
     
@@ -321,6 +620,7 @@ def evaluate_sample(
         label_path: Path to ground truth label
         pred_folder: Folder containing predictions (for logits/probs)
         num_bins: Number of bins for calibration metrics
+        compute_lesion_wise: Whether to compute per-lesion metrics
         
     Returns:
         Dictionary of metrics for this sample
@@ -482,6 +782,30 @@ def evaluate_sample(
     metrics['num_target_voxels_full'] = int(label_binary_full.sum())  # Target lesion voxels (full volume)
     metrics['has_lesion'] = int(label_binary_full.sum() > 0)  # Whether the case has any lesion
     
+    # ==========================================================================
+    # Lesion-wise statistics (if enabled)
+    # ==========================================================================
+    if compute_lesion_wise:
+        # Load logits for lesion-wise calibration if not already loaded
+        logits_for_lesions = None
+        logits_path = pred_folder / f"{case_name}_logits.nii.gz"
+        if logits_path.exists():
+            try:
+                logits_for_lesions, _, _ = load_nifti(logits_path)
+            except Exception as e:
+                logger.warning(f"Could not load logits for lesion-wise metrics: {e}")
+        
+        lesion_metrics = compute_lesion_wise_metrics(
+            label_data=label_data,
+            pred_data=pred_data,
+            logits_data=logits_for_lesions,
+            valid_mask=valid_mask,
+            spacing=label_spacing,
+            num_bins=num_bins
+        )
+        metrics['lesion_wise_metrics'] = lesion_metrics
+        metrics['num_lesions'] = len(lesion_metrics)
+    
     return metrics
 
 
@@ -490,14 +814,14 @@ def evaluate_sample_wrapper(args: Tuple) -> Dict:
     Wrapper for evaluate_sample to work with ProcessPoolExecutor.
     
     Args:
-        args: Tuple of (case_name, pred_path, label_path, pred_folder, num_bins)
+        args: Tuple of (case_name, pred_path, label_path, pred_folder, num_bins, compute_lesion_wise)
         
     Returns:
         Dictionary of metrics for this sample
     """
-    case_name, pred_path, label_path, pred_folder, num_bins = args
+    case_name, pred_path, label_path, pred_folder, num_bins, compute_lesion_wise = args
     try:
-        return evaluate_sample(case_name, pred_path, label_path, pred_folder, num_bins)
+        return evaluate_sample(case_name, pred_path, label_path, pred_folder, num_bins, compute_lesion_wise)
     except Exception as e:
         return {'case_name': case_name, 'error': str(e)}
 
@@ -609,6 +933,13 @@ def main():
         help='Number of parallel workers (default: 12)'
     )
     
+    parser.add_argument(
+        '--compute_lesion_wise_statistics',
+        action='store_true',
+        default=False,
+        help='Compute per-lesion metrics (detection, ECE, MCE, NLL, Brier) aggregated by lesion size'
+    )
+    
     args = parser.parse_args()
     
     pred_folder = Path(args.predictions)
@@ -635,10 +966,12 @@ def main():
     
     logger.info(f"Found {len(matches)} matching samples")
     logger.info(f"Using {num_workers} parallel workers")
+    if args.compute_lesion_wise_statistics:
+        logger.info("Lesion-wise statistics: ENABLED")
     
     # Prepare arguments for parallel processing
     eval_args = [
-        (case_name, pred_path, label_path, pred_folder, args.num_bins)
+        (case_name, pred_path, label_path, pred_folder, args.num_bins, args.compute_lesion_wise_statistics)
         for case_name, pred_path, label_path in matches
     ]
     
@@ -656,20 +989,75 @@ def main():
                 logger.error(f"Error evaluating {case_name}: {e}")
                 results.append({'case_name': case_name, 'error': str(e)})
     
-    # Create DataFrame
-    df = pd.DataFrame(results)
+    # Create DataFrame (exclude lesion_wise_metrics column for CSV - it will be saved separately)
+    df_for_csv = pd.DataFrame([{k: v for k, v in r.items() if k != 'lesion_wise_metrics'} for r in results])
     
     # Save per-sample CSV
     csv_path = output_folder / 'per_sample_metrics.csv'
-    df.to_csv(csv_path, index=False)
+    df_for_csv.to_csv(csv_path, index=False)
     logger.info(f"Saved per-sample metrics to: {csv_path}")
     
     # Aggregate and save JSON
-    aggregated = aggregate_metrics(df)
+    aggregated = aggregate_metrics(df_for_csv)
     json_path = output_folder / 'aggregated_metrics.json'
     with open(json_path, 'w') as f:
         json.dump(aggregated, f, indent=2)
     logger.info(f"Saved aggregated metrics to: {json_path}")
+    
+    # Handle lesion-wise statistics if enabled
+    if args.compute_lesion_wise_statistics:
+        # Collect all lesion-wise metrics from all samples
+        all_lesion_metrics = []
+        for result in results:
+            if 'lesion_wise_metrics' in result and result['lesion_wise_metrics']:
+                case_name = result['case_name']
+                for lesion_m in result['lesion_wise_metrics']:
+                    lesion_m_copy = lesion_m.copy()
+                    lesion_m_copy['case_name'] = case_name
+                    all_lesion_metrics.append(lesion_m_copy)
+        
+        if all_lesion_metrics:
+            # Save per-lesion CSV
+            lesion_df = pd.DataFrame(all_lesion_metrics)
+            lesion_csv_path = output_folder / 'per_lesion_metrics.csv'
+            lesion_df.to_csv(lesion_csv_path, index=False)
+            logger.info(f"Saved per-lesion metrics to: {lesion_csv_path}")
+            
+            # Aggregate by size bin
+            lesion_aggregated = aggregate_lesion_metrics_by_size(all_lesion_metrics)
+            lesion_json_path = output_folder / 'lesion_wise_aggregated_metrics.json'
+            with open(lesion_json_path, 'w') as f:
+                json.dump(lesion_aggregated, f, indent=2)
+            logger.info(f"Saved lesion-wise aggregated metrics to: {lesion_json_path}")
+            
+            # Print lesion-wise summary
+            print("\n" + "="*60)
+            print("LESION-WISE STATISTICS BY SIZE BIN")
+            print("="*60)
+            print(f"Total lesions analyzed: {len(all_lesion_metrics)}")
+            print()
+            print("Size bin definitions (volume in mm³):")
+            for bin_name, (lower, upper) in LESION_SIZE_BINS.items():
+                upper_str = f"{upper:.0f}" if upper != float('inf') else "∞"
+                print(f"  {bin_name:12s}: {lower:.0f} - {upper_str}")
+            print()
+            
+            for bin_name in list(LESION_SIZE_BINS.keys()) + ['overall']:
+                if bin_name in lesion_aggregated:
+                    bin_data = lesion_aggregated[bin_name]
+                    count = bin_data.get('count', 0)
+                    if count > 0:
+                        det_rate = bin_data.get('detection_rate_overall', np.nan)
+                        print(f"{bin_name.upper():12s} (n={count}):")
+                        print(f"  Detection rate: {det_rate:.4f}")
+                        for metric in ['ece', 'mce', 'nll', 'brier_score']:
+                            if metric in bin_data and isinstance(bin_data[metric], dict):
+                                m = bin_data[metric]
+                                if not np.isnan(m.get('mean', np.nan)):
+                                    print(f"  {metric:12s}: {m['mean']:.4f} ± {m['std']:.4f}")
+                        print()
+        else:
+            logger.warning("No lesions found for lesion-wise analysis")
     
     # Print summary
     print("\n" + "="*60)
