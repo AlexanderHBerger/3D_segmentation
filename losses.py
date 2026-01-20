@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.amp import custom_fwd, custom_bwd
+from baselines.svls import CELossWithSVLS
 import numpy as np
 from typing import List, Optional
 
@@ -250,7 +251,7 @@ class DeepSupervisionLoss(nn.Module):
         return total_loss
 
 
-def get_loss_function(config) -> nn.Module:
+def get_loss_function(config, device) -> nn.Module:
     """Get loss function based on configuration"""
     ignore_index = getattr(config.training, 'ignore_index', -1)
     use_fixed_grad_softmax = getattr(config.training, 'use_fixed_grad_softmax', False)
@@ -270,9 +271,13 @@ def get_loss_function(config) -> nn.Module:
     
     elif config.training.loss_function == "ce":
         # throw error if use_fixed_grad_softmax is set
+        weights = getattr(config.training, 'class_weights', None)
+        if weights is not None:
+            weights = torch.tensor(weights, dtype=torch.float32).to(device)
+        print("Class weights for CE loss:", weights)
         if use_fixed_grad_softmax:
             raise NotImplementedError("use_fixed_grad_softmax is not implemented for CrossEntropy loss")
-        return nn.CrossEntropyLoss(ignore_index=ignore_index)
+        return nn.CrossEntropyLoss(ignore_index=ignore_index, weight=weights)
     
     elif config.training.loss_function == "focal":
         return FocalLoss(alpha=1.0, gamma=2.0, ignore_index=ignore_index)
@@ -344,7 +349,20 @@ def get_loss_function(config) -> nn.Module:
             dice_plus_plus=False,
             tversky_beta=tversky_beta
         )
-    
+    elif config.training.loss_function == "svls":
+        sigma = getattr(config.training, 'sigma', 1.0)
+        weights = getattr(config.training, 'class_weights', None)
+        if weights is not None:
+            weights = torch.tensor(weights, dtype=torch.float32).to(device)
+        num_classes = config.data.num_classes # Ensure this exists
+        print("Class weights for SVLS loss:", weights)
+        return CELossWithSVLS(
+            classes=num_classes,
+            sigma=sigma,
+            ignore_index=ignore_index,
+            weights=weights
+        )
+
     else:
         raise ValueError(f"Unknown loss function: {config.training.loss_function}")
 
@@ -425,8 +443,9 @@ class FixedGradSoftmax(torch.autograd.Function):
             
             # For foreground (y=1), suppress gradient based on prediction confidence
             # This ensures gradient is zero when prediction is already correct
-            error_weight[targets == 1] = error_weight[targets == 1] * (1 - torch.pow(probs[targets == 1], 20))
-            error_weight[targets == 0] = error_weight[targets == 0] * (1 - torch.pow(1 - probs[targets == 0], 20))
+            exponential_correction = exponential_correction if exponential_correction is not None else 20
+            error_weight[targets == 1] = error_weight[targets == 1] * (1 - torch.pow(probs[targets == 1], exponential_correction))
+            error_weight[targets == 0] = error_weight[targets == 0] * (1 - torch.pow(1 - probs[targets == 0], exponential_correction))
         elif exponential_correction is not None:
             # Tunable gradient weight: 0.25 * (error - error^exponential)
             error_weight = 0.25 * (error - torch.pow(error, exponential_correction))

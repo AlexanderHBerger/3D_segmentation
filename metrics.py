@@ -9,28 +9,36 @@ import torch.nn.functional as F
 def prepare_targets_with_mask(
     targets: torch.Tensor,
     num_classes: int,
-    ignore_index: int = -1
+    ignore_index: int = -1,
+    additional_mask: torch.Tensor = None
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Centralized utility to prepare targets and create valid mask.
     
     This function handles the common pattern of:
     1. Creating a mask for valid voxels (excluding ignore_index)
-    2. Clamping targets to valid range [0, num_classes)
+    2. Optionally intersecting with an additional mask (e.g., foreground union)
+    3. Clamping targets to valid range [0, num_classes)
     
     Args:
         targets: (B, H, W, D) - class indices
         num_classes: Number of classes
         ignore_index: Index to ignore in target
+        additional_mask: Optional (B, H, W, D) boolean mask to further restrict valid voxels
+                        (e.g., foreground union mask for calibration on foreground only)
     
     Returns:
         Tuple of (valid_mask, targets_clamped, num_valid_voxels):
-        - valid_mask: (B, H, W, D) - boolean mask where targets != ignore_index
+        - valid_mask: (B, H, W, D) - boolean mask where targets != ignore_index (and additional_mask if provided)
         - targets_clamped: (B, H, W, D) - targets clamped to [0, num_classes)
         - num_valid_voxels: scalar - total number of valid voxels
     """
     # Create mask for valid voxels (not ignore_index)
     valid_mask = targets != ignore_index
+    
+    # Intersect with additional mask if provided
+    if additional_mask is not None:
+        valid_mask = valid_mask & additional_mask
     
     # Clamp targets to valid range [0, num_classes) for safety
     targets_clamped = torch.clamp(targets, 0, num_classes - 1)
@@ -346,6 +354,7 @@ def compute_calibration_metrics(
         for b in range(batch_size):
             # Get single sample tensors
             probs_b = probs[b]  # (C, H, W, D)
+            logits_b = logits[b]  # (C, H, W, D)
             targets_b = targets[b]  # (H, W, D)
             targets_clamped_b = targets_clamped[b]  # (H, W, D)
             valid_mask_b = valid_mask[b]  # (H, W, D)
@@ -353,11 +362,13 @@ def compute_calibration_metrics(
             # Flatten spatial dimensions for per-voxel metrics
             # (C, H, W, D) -> (H*W*D, C)
             probs_flat = probs_b.permute(1, 2, 3, 0).reshape(-1, num_classes)
+            logits_flat = logits_b.permute(1, 2, 3, 0).reshape(-1, num_classes)
             targets_flat = targets_clamped_b.reshape(-1)
             valid_mask_flat = valid_mask_b.reshape(-1)
             
             # Filter to only valid voxels
             probs_valid = probs_flat[valid_mask_flat]
+            logits_valid = logits_flat[valid_mask_flat]
             targets_valid = targets_flat[valid_mask_flat]
             num_valid = valid_mask_flat.sum()
             
@@ -378,9 +389,7 @@ def compute_calibration_metrics(
             mce_samples.append(mce.item())
 
             # 3. Negative Log-Likelihood (NLL) - per sample
-            logits_b = logits[b:b+1]  # Keep batch dim: (1, C, H, W, D)
-            targets_b_orig = targets[b:b+1]  # Keep batch dim: (1, H, W, D)
-            nll = F.cross_entropy(logits_b, targets_b_orig, reduction='mean', ignore_index=ignore_index)
+            nll = F.cross_entropy(logits_valid, targets_valid, reduction='mean', ignore_index=ignore_index)
             nll_samples.append(nll.item())
 
             # 4. Brier Score per sample

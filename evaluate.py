@@ -609,7 +609,8 @@ def evaluate_sample(
     label_path: Path,
     pred_folder: Path,
     num_bins: int = 15,
-    compute_lesion_wise: bool = False
+    compute_lesion_wise: bool = False,
+    calibration_on_foreground_union: bool = False
 ) -> Dict:
     """
     Evaluate a single sample.
@@ -621,6 +622,8 @@ def evaluate_sample(
         pred_folder: Folder containing predictions (for logits/probs)
         num_bins: Number of bins for calibration metrics
         compute_lesion_wise: Whether to compute per-lesion metrics
+        calibration_on_foreground_union: If True, compute calibration metrics only on
+            pixels where either prediction or label is foreground
         
     Returns:
         Dictionary of metrics for this sample
@@ -750,9 +753,18 @@ def evaluate_sample(
             # Get number of classes
             num_classes = logits_torch.shape[1]
             
+            # Create foreground union mask if requested (pixels where either pred or label is foreground)
+            additional_mask = None
+            if calibration_on_foreground_union:
+                # Compute foreground union: where either prediction or label is foreground
+                pred_foreground = (pred_data > 0) & valid_mask  # Predicted foreground within valid region
+                label_foreground = (label_data > 0) & valid_mask  # Label foreground within valid region
+                foreground_union = pred_foreground | label_foreground
+                additional_mask = torch.from_numpy(foreground_union).bool().unsqueeze(0)  # (1, X, Y, Z)
+            
             # Use prepare_targets_with_mask from metrics.py
             valid_mask_torch, targets_clamped, num_valid_voxels = prepare_targets_with_mask(
-                target_torch, num_classes, ignore_index=-1
+                target_torch, num_classes, ignore_index=-1, additional_mask=additional_mask
             )
             
             # Compute calibration metrics using the training module's function
@@ -814,14 +826,14 @@ def evaluate_sample_wrapper(args: Tuple) -> Dict:
     Wrapper for evaluate_sample to work with ProcessPoolExecutor.
     
     Args:
-        args: Tuple of (case_name, pred_path, label_path, pred_folder, num_bins, compute_lesion_wise)
+        args: Tuple of (case_name, pred_path, label_path, pred_folder, num_bins, compute_lesion_wise, calibration_on_foreground_union)
         
     Returns:
         Dictionary of metrics for this sample
     """
-    case_name, pred_path, label_path, pred_folder, num_bins, compute_lesion_wise = args
+    case_name, pred_path, label_path, pred_folder, num_bins, compute_lesion_wise, calibration_on_foreground_union = args
     try:
-        return evaluate_sample(case_name, pred_path, label_path, pred_folder, num_bins, compute_lesion_wise)
+        return evaluate_sample(case_name, pred_path, label_path, pred_folder, num_bins, compute_lesion_wise, calibration_on_foreground_union)
     except Exception as e:
         return {'case_name': case_name, 'error': str(e)}
 
@@ -940,6 +952,13 @@ def main():
         help='Compute per-lesion metrics (detection, ECE, MCE, NLL, Brier) aggregated by lesion size'
     )
     
+    parser.add_argument(
+        '--calibration_on_foreground_union',
+        action='store_true',
+        default=False,
+        help='Compute calibration metrics only on pixels where either prediction or label is foreground (union of foreground regions)'
+    )
+    
     args = parser.parse_args()
     
     pred_folder = Path(args.predictions)
@@ -971,7 +990,7 @@ def main():
     
     # Prepare arguments for parallel processing
     eval_args = [
-        (case_name, pred_path, label_path, pred_folder, args.num_bins, args.compute_lesion_wise_statistics)
+        (case_name, pred_path, label_path, pred_folder, args.num_bins, args.compute_lesion_wise_statistics, args.calibration_on_foreground_union)
         for case_name, pred_path, label_path in matches
     ]
     
