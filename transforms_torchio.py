@@ -25,6 +25,7 @@ nnU-Net Augmentation Pipeline (as per paper):
 """
 import torchio as tio
 import torch
+import torch.nn.functional as F
 import numpy as np
 from typing import Optional, Tuple
 from math import sqrt
@@ -76,6 +77,71 @@ class RotationScalingTransform:
         )
         
         return transform(subject)
+
+
+class ElasticDeformationTransform:
+    """
+    Elastic deformation using torch grid_sample (CPU, OpenMP-parallelized).
+
+    ~6x faster than TorchIO's SimpleITK-based RandomElasticDeformation.
+    Uses trilinear upsampling of a coarse random displacement field,
+    then applies it via grid_sample (bilinear for images, nearest for labels).
+    Safe for use in DataLoader worker processes (no GPU needed).
+    """
+    def __init__(self, num_control_points=7, max_displacement=5.0, p=0.2):
+        self.num_control_points = num_control_points
+        self.max_displacement = max_displacement
+        self.p = p
+
+    def __call__(self, subject):
+        if np.random.random() >= self.p:
+            return subject
+
+        cp = self.num_control_points
+        image_tensor = subject['image'].data  # (C, W, H, D)
+        label_tensor = subject['label'].data  # (C, W, H, D)
+
+        C, W, H, D = image_tensor.shape
+
+        # Generate coarse random displacement field on control grid
+        # displacements in voxels, normalized to [-1, 1] grid space
+        disp = (torch.rand(1, 3, cp, cp, cp) * 2 - 1) * self.max_displacement
+        disp[:, 0] *= 2.0 / W
+        disp[:, 1] *= 2.0 / H
+        disp[:, 2] *= 2.0 / D
+
+        # Upsample to full resolution (trilinear ~ cubic B-spline for augmentation)
+        disp_full = F.interpolate(disp, size=(W, H, D), mode='trilinear', align_corners=True)
+
+        # Create identity grid and add displacement
+        grid = F.affine_grid(
+            torch.eye(3, 4).unsqueeze(0), [1, 1, W, H, D], align_corners=True
+        )  # (1, W, H, D, 3)
+        grid = grid + disp_full.permute(0, 2, 3, 4, 1)
+
+        # Warp image (bilinear) and label (nearest)
+        warped_image = F.grid_sample(
+            image_tensor.unsqueeze(0), grid, mode='bilinear',
+            padding_mode='border', align_corners=True
+        ).squeeze(0)
+        warped_label = F.grid_sample(
+            label_tensor.float().unsqueeze(0), grid, mode='nearest',
+            padding_mode='border', align_corners=True
+        ).squeeze(0).to(label_tensor.dtype)
+
+        subject['image'].set_data(warped_image)
+        subject['label'].set_data(warped_label)
+
+        # Warp weight_map if present
+        if 'weight_map' in subject:
+            weight_tensor = subject['weight_map'].data
+            warped_weight = F.grid_sample(
+                weight_tensor.unsqueeze(0), grid, mode='bilinear',
+                padding_mode='border', align_corners=True
+            ).squeeze(0)
+            subject['weight_map'].set_data(warped_weight)
+
+        return subject
 
 
 class GammaTransformWithRetainStats:
@@ -232,7 +298,8 @@ class OversizedCrop:
         self,
         target_size: Tuple[int, int, int],
         foreground_oversample_percent: float = 0.0,
-        padding_mode: str = 'minimum'
+        padding_mode: str = 'minimum',
+        center: bool = False
     ):
         """
         Args:
@@ -243,6 +310,7 @@ class OversizedCrop:
         self.target_size = target_size
         self.foreground_oversample_percent = foreground_oversample_percent
         self.padding_mode = padding_mode
+        self.center = center
     
     def __call__(self, subject):
         """
@@ -267,7 +335,6 @@ class OversizedCrop:
                 padding_mode=self.padding_mode,
                 copy=False
             )
-            print("Using CropOrPad for small volume.", flush=True)
             return transform(subject)
         
         # For large volumes: random crop
@@ -280,9 +347,13 @@ class OversizedCrop:
         if use_foreground:
             # Sample from foreground
             start_w, start_h, start_d  = self._sample_foreground_crop(subject, current_shape_whd, target_shape_whd)
+        elif self.center:
+            start_w = (current_shape_whd[0] - target_shape_whd[0]) // 2
+            start_h = (current_shape_whd[1] - target_shape_whd[1]) // 2
+            start_d = (current_shape_whd[2] - target_shape_whd[2]) // 2
         else:
-            # Sample uniformly
-            start_w, start_h, start_d  = self._sample_uniform_crop(current_shape_whd, target_shape_whd)
+            # Sample uniformly from valid locations
+            start_w, start_h, start_d  = self._sample_uniform_crop(subject, current_shape_whd, target_shape_whd)
         
         # Calculate how much to crop from each side
         # W dimension (width, index 0)
@@ -307,8 +378,15 @@ class OversizedCrop:
 
         # Apply crop
         new_subject = {}
-        new_subject["image"] = subject['image'][w_ini:w_ini + target_shape_whd[0], h_ini:h_ini + target_shape_whd[1], d_ini:d_ini + target_shape_whd[2]]
-        new_subject["label"] = subject['label'][w_ini:w_ini + target_shape_whd[0], h_ini:h_ini + target_shape_whd[1], d_ini:d_ini + target_shape_whd[2]]
+        image = subject['image'][w_ini:w_ini + target_shape_whd[0], h_ini:h_ini + target_shape_whd[1], d_ini:d_ini + target_shape_whd[2]].data.clone()
+        label = subject['label'][w_ini:w_ini + target_shape_whd[0], h_ini:h_ini + target_shape_whd[1], d_ini:d_ini + target_shape_whd[2]].data.clone()
+        new_subject["image"] = tio.ScalarImage(tensor=image, affine=subject['image'].affine)
+        new_subject["label"] = tio.LabelMap(tensor=label, affine=subject['label'].affine)
+        
+        # Crop weight_map if present (using same crop coordinates)
+        if 'weight_map' in subject:
+            weight_map = subject['weight_map'][w_ini:w_ini + target_shape_whd[0], h_ini:h_ini + target_shape_whd[1], d_ini:d_ini + target_shape_whd[2]].data.clone()
+            new_subject["weight_map"] = tio.ScalarImage(tensor=weight_map, affine=subject['weight_map'].affine)
     
         new_subject["case_id"] = subject['case_id']
         if 'foreground_coords' in subject:
@@ -319,23 +397,38 @@ class OversizedCrop:
 
         return new_subject
 
-    def _sample_uniform_crop(self, volume_shape: np.ndarray, target_shape: np.ndarray) -> np.ndarray:
+    def _sample_uniform_crop(self, subject: tio.Subject, volume_shape: np.ndarray, target_shape: np.ndarray) -> np.ndarray:
         """
         Sample a random crop location uniformly.
         
         Args:
+            subject: TorchIO Subject
             volume_shape: Shape of the volume (W, H, D) in TorchIO ordering
             target_shape: Size of patch to crop (W, H, D)
         
         Returns:
             Crop coordinates [w_start, h_start, d_start] in (W, H, D) ordering
         """
-        # Compute valid range for crop start (ensure crop fits in volume)
-        valid_start = np.maximum(0, volume_shape - target_shape)
+        if 'valid_coords' in subject:
+            valid_coords = subject['valid_coords']
+        else:
+            print("Computing valid coordinates for sampling.", flush=True)
+            # Get label data
+            label = subject['label'].data  # (C, W, H, D)
+            
+            # Find all valid voxel coordinates
+            valid_mask = label[0] >= 0
+            valid_coords = np.argwhere(valid_mask)
         
-        # Sample random start location
+        # Sample a random valid voxel
+        random_idx = np.random.randint(0, len(valid_coords))
+        valid_coord = valid_coords[random_idx]
+        
         start_coords = np.array([
-            np.random.randint(0, max(1, valid_start[i] + 1))
+            np.random.randint(
+                max(0, valid_coord[i] - target_shape[i] + 1),
+                min(valid_coord[i] + 1, volume_shape[i] - target_shape[i] + 1)
+            )
             for i in range(3)
         ])
         
@@ -360,7 +453,6 @@ class OversizedCrop:
         """
         # Check if precomputed foreground coordinates are available
         if 'foreground_coords' in subject:
-            print("Using precomputed foreground coordinates for sampling.", flush=True)
             foreground_coords = subject['foreground_coords']
         else:
             print("Computing foreground coordinates for sampling.", flush=True)
@@ -377,24 +469,22 @@ class OversizedCrop:
         
         # Sample a random foreground voxel
         random_idx = np.random.randint(0, len(foreground_coords))
-        center_coord = foreground_coords[random_idx]
+        foreground_coord = foreground_coords[random_idx]
         
-        # Compute crop start (center crop on foreground voxel)
-        start_coords = center_coord - target_shape // 2
-        
-        # Ensure crop stays within volume bounds
-        start_coords = np.maximum(0, start_coords)
-        start_coords = np.minimum(start_coords, volume_shape - target_shape)
+        # Allow foreground voxel to be anywhere in the crop (not just centered)
+        # For each dimension, the crop can start anywhere from:
+        # [foreground_coord - target_shape + 1] to [foreground_coord]
+        # This ensures the foreground voxel is included in the crop
+        start_coords = np.array([
+            np.random.randint(
+                max(0, foreground_coord[i] - target_shape[i] + 1),
+                min(foreground_coord[i] + 1, volume_shape[i] - target_shape[i] + 1)
+            )
+            for i in range(3)
+        ])
         
         return start_coords
 
-
-class IdentityTransform:
-    def __call__(self, x):
-        print(f"Shape: {x.shape}, Mean: {x.mean().item():.4f}, Std: {x.std().item():.4f}")
-        return x
-    
-print_stats = IdentityTransform()
 
 def get_training_transforms(config, oversize_factor: float = 1.25) -> tio.Compose:
     """
@@ -420,18 +510,8 @@ def get_training_transforms(config, oversize_factor: float = 1.25) -> tio.Compos
         Composed TorchIO transforms for training
     """
     transforms = []
-    
-    # 0. Oversize-Crop strategy (before augmentation to reduce border artifacts)
-    # This handles both padding for small volumes and random cropping for large ones
-    oversized_patch_size = tuple(int(s * oversize_factor) for s in config.data.patch_size)
-    # transforms.append(
-    #     OversizedCrop(
-    #         target_size=oversized_patch_size,
-    #         foreground_oversample_percent=config.training.oversample_foreground_percent,
-    #         padding_mode='minimum'
-    #     )
-    # )
-    
+
+
     # ===== SPATIAL TRANSFORMS =====
     
     # 1. SpatialTransform: Combined Rotation + Scaling (SINGLE interpolation for efficiency)
@@ -452,15 +532,13 @@ def get_training_transforms(config, oversize_factor: float = 1.25) -> tio.Compos
         )
     
     # Elastic Deformation (disabled in nnU-Net: p_elastic_deform=0, but included for flexibility)
+    # Uses torch grid_sample instead of TorchIO/SimpleITK (~6x faster, worker-safe)
     if config.augmentation.elastic_deform_prob > 0:
         transforms.append(
-            tio.RandomElasticDeformation(
-                num_control_points=(7, 7, 7),
-                max_displacement=config.augmentation.elastic_deform_sigma[1] / 10,
-                image_interpolation='linear',
-                label_interpolation='nearest',
+            ElasticDeformationTransform(
+                num_control_points=config.augmentation.elastic_deform_num_control_points,
+                max_displacement=config.augmentation.elastic_deform_max_displacement,
                 p=config.augmentation.elastic_deform_prob,
-                copy=False
             )
         )
     
@@ -474,6 +552,7 @@ def get_training_transforms(config, oversize_factor: float = 1.25) -> tio.Compos
                 std=(sqrt(config.augmentation.gaussian_noise_variance[0]), 
                      sqrt(config.augmentation.gaussian_noise_variance[1])),
                 p=config.augmentation.gaussian_noise_prob,
+                include=['image'],  # Only apply to image, not weight_map
                 copy=False
             )
         )
@@ -484,6 +563,7 @@ def get_training_transforms(config, oversize_factor: float = 1.25) -> tio.Compos
             tio.RandomBlur(
                 std=config.augmentation.gaussian_blur_sigma,
                 p=config.augmentation.gaussian_blur_prob,
+                include=['image'],  # Only apply to image, not weight_map
                 copy=False
             )
         )
@@ -526,6 +606,7 @@ def get_training_transforms(config, oversize_factor: float = 1.25) -> tio.Compos
                 downsampling=(downsampling_min, downsampling_max),
                 image_interpolation='linear',
                 p=config.augmentation.simulate_low_res_prob,
+                include=['image'],  # Only apply to image, not weight_map
                 copy=False
             )
         )
@@ -578,7 +659,6 @@ def get_training_transforms(config, oversize_factor: float = 1.25) -> tio.Compos
     # after all augmentations to remove border artifacts
     
     print(f"Training augmentation pipeline created:")
-    print(f"  - Oversized patch size: {oversized_patch_size} (oversize factor: {oversize_factor})")
     print(f"  - Foreground oversampling: {config.training.oversample_foreground_percent*100:.0f}%")
     print(f"  - Number of augmentation transforms: {len(transforms)}")
     
@@ -599,7 +679,6 @@ def get_validation_transforms(config) -> Optional[tio.Compose]:
     Returns:
         None (no transforms needed for validation, final crop done in Dataset)
     """
-    # Note: Final center crop to target patch size is done in the Dataset class
     return None
 
 

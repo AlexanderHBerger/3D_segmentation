@@ -1,9 +1,9 @@
 """
-Configuration file for MedNeXt training based on nnUNet learnings
+Configuration for 3D segmentation training based on nnUNet methodology
 """
 import os
 import numpy as np
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Any, Optional
 
 
@@ -12,34 +12,36 @@ class DataConfig:
     """Data configuration based on nnUNet preprocessing"""
     # Dataset path - interpretation depends on use_preprocessed flag:
     #   - If use_preprocessed=False: path to raw nnUNet data (imagesTr/labelsTr structure)
-    #   - If use_preprocessed=True: path to preprocessed numpy arrays (.npy files)
-    data_path: str = "/ministorage/ahb/data/nnUNet_preprocessed/Dataset017_SmallBrats_Fast"
-    
+    #   - If use_preprocessed=True: path to preprocessed numpy arrays (.npy or .npz files)
+    data_path: str = "./data"
     # Preprocessing mode
-    use_preprocessed: bool = True  # If True: load .npy files, skip resampling/normalization
+    use_preprocessed: bool = True  # If True: load .npy/.npz files, skip resampling/normalization
                                    # If False: load NIfTI from data_path, apply full preprocessing
+    
+    # Compression mode (only used when use_preprocessed=True)
+    use_compressed: bool = True  # If True: load .npz files, If False: load .npy files
     
     # Dataset properties from nnUNet analysis
     target_spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0)
     
     # Patch configuration from nnUNet 3d_fullres
-    #patch_size: Tuple[int, int, int] = (160, 192, 160)
-    patch_size: Tuple[int, int, int] = (80, 96, 80)
-    #patch_size : Tuple[int, int, int] = (60, 72, 60)  # Reduced for memory constraints
+    patch_size: Tuple[int, int, int] = (128, 128, 128)
 
     # Normalization (nnUNet uses ZScore with mask)
     normalization_scheme: str = "zscore"
     use_mask_for_norm: bool = True
     
     # Channel configuration
-    num_input_channels: int = 1  # T1c only
-    num_classes: int = 2  # background + metastasis
+    num_input_channels: int = 1
+    num_classes: int = 2  # background + foreground
     
     # Cross-validation
-    num_folds: int = 1
+    num_folds: int = 3
     
-    # Debug options (only used when use_preprocessed=False)
-    brats_only: bool = False
+    # Train on all data (no validation split)
+    train_on_all: bool = False
+
+    # Debug options
     max_samples: Optional[int] = None
 
 
@@ -82,41 +84,66 @@ class ModelConfig:
 class TrainingConfig:
     """Training configuration based on nnUNet setup"""
     # Conservative batch size for memory constraints (can increase if more GPU memory available)
-    batch_size: int = 16
+    batch_size: int = 6
+    patches_per_volume: int = 10   # nnUNet uses 4 patches per volume for 3d_fullres
     
     # Training parameters
-    max_epochs: int = 400
+    max_epochs: int = 250
     num_iterations_per_epoch: int = 250  # nnUNet uses fixed 250 iterations per epoch
-    initial_lr: float = 0.008
-    weight_decay: float = 2e-5
-    momentum: float = 0.98
+    initial_lr: float = 0.015
+    weight_decay: float = 5e-5
+    momentum: float = 0.99
+    
+    # Warm restart parameters (for continuing training with extended epochs)
+    warm_restart_lr_factor: float = 0.4  # Multiplier for initial LR on warm restart
     
     # Foreground oversampling (nnUNet uses 0.33)
-    oversample_foreground_percent: float = 0.33
+    oversample_foreground_percent: float = 0.33  # Always sample foreground patches
     
     # Learning rate scheduling
     lr_scheduler: str = "poly"  # nnUNet uses polynomial decay
     poly_lr_pow: float = 0.9
     
     # Loss configuration
-    loss_function: str = "tversky"  # Dice + CrossEntropy like nnUNet
+    loss_function: str = "combined"
     dice_weight: float = 1.0
     ce_weight: float = 1.0
+    cldice_alpha: float = 0.0  # Weight for clDice component (0 = disabled, 0.5 = equal weight with Dice)
+    
+    weight_map_scale: float = 6.0 # Scale factor for the weight maps (0 = no weighting)
+    weight_map_bias: float = 0.2  # Bias added to the weights
+    use_weight_map: bool = True  # If True, use per-pixel weight maps for CE loss
+    
+    topograph_weight: float = 0.0  # Weight for topograph loss component
+    topograph_num_processes: int = 16
+    topograph_thres_var: float = 0.0
+    topograph_aggregation: str = "CE" 
+    topograph_debug: bool = False
+    topograph_error_type: str = "false_positives"
+
+    # Betti matching loss configuration (used when loss_function contains "betti")
+    betti_weight: float = 0.0  # Weight for Betti matching loss component
+    betti_relative: bool = False  # Use relative homology (pads input with boundary)
+    betti_cpu_batch_size: int = 16  # CPU batch size for matching computation (lower = less memory)
+    betti_subsampling_size: Optional[int] = 64  # If set, subsample to this many points for matching (reduces memory)
+    betti_subsampling_mode: str = "random_crop"  # Method for subsampling
+
     dice_plus_plus_gamma: float = 2.0  # Gamma for DSC++ loss
     tversky_beta: float = 0.5  # Beta for Tversky loss (only used when loss_function is "tversky" or "tversky_ce")
+
     ignore_index: int = -1  # Ignore label value in loss calculation
     
     # Softmax gradient configuration
     # If True: uses FixedGradSoftmax (hybrid gradient for Dice loss computation)
     # If False: uses standard softmax (PyTorch default)
-    use_fixed_grad_softmax: bool = True
+    use_fixed_grad_softmax: bool = False
     exponential_correction: Optional[int] = 50
     
     # Deep supervision (if using MedNeXt with deep supervision)
     deep_supervision_weights: List[float] = None
     
     # Validation
-    val_check_interval: int = 20  # Check validation every N epochs
+    val_check_interval: int = 10  # Check validation every N epochs
     patience: int = 200  # Early stopping patience
     
     # Checkpointing
@@ -138,9 +165,9 @@ class AugmentationConfig:
     scale_range: Tuple[float, float] = (0.7, 1.4)
     
     # nnUNet sets p_elastic_deform=0 (disabled in SpatialTransform)
-    elastic_deform_prob: float = 0.0
-    elastic_deform_alpha: Tuple[float, float] = (0., 900.)
-    elastic_deform_sigma: Tuple[float, float] = (9., 13.)
+    elastic_deform_prob: float = 0.2
+    elastic_deform_max_displacement: float = 5.0  # Max displacement in voxels (TorchIO parameterization)
+    elastic_deform_num_control_points: int = 7    # B-spline control grid resolution per axis
     
     # Intensity transformations - nnUNet exact specification
     # Gamma with invert: p=0.1
@@ -180,36 +207,36 @@ class AugmentationConfig:
 @dataclass
 class WandbConfig:
     """Weights & Biases configuration"""
-    project: str = "Metastases Segmentation"
-    entity: str = None  # Set to your wandb username/team
+    project: str = "3D-Segmentation"
+    entity: Optional[str] = None  # Set to your wandb username/team
     tags: List[str] = None
-    notes: str = "Training for brain metastasis segmentation based on nnUNet learnings"
-    
+    notes: str = ""
+
     def __post_init__(self):
         if self.tags is None:
-            self.tags = ["mednext", "brain", "metastasis", "segmentation", "medical"]
+            self.tags = ["segmentation", "3d"]
 
 
 @dataclass
 class Config:
     """Main configuration class"""
-    data: DataConfig = DataConfig()
-    model: ModelConfig = ModelConfig()
-    training: TrainingConfig = TrainingConfig()
-    augmentation: AugmentationConfig = AugmentationConfig()
-    wandb: WandbConfig = WandbConfig()
+    data: DataConfig = field(default_factory=DataConfig)
+    model: ModelConfig = field(default_factory=ModelConfig)
+    training: TrainingConfig = field(default_factory=TrainingConfig)
+    augmentation: AugmentationConfig = field(default_factory=AugmentationConfig)
+    wandb: WandbConfig = field(default_factory=WandbConfig)
     
     # General settings
     seed: int = 42
-    num_workers: int = 8
+    num_workers: int = 14
     pin_memory: bool = True
     
     # GPU settings
     device: str = "cuda"
-    mixed_precision: bool = True
+    mixed_precision: bool = False
     
     # Output directory
-    output_dir: str = "/ministorage/ahb/scratch/segmentation_model/experiments"
+    output_dir: str = "./experiments"
     
     def __post_init__(self):
         # Ensure output directory exists

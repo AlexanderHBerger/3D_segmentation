@@ -5,9 +5,42 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.amp import custom_fwd, custom_bwd
-from baselines.svls import CELossWithSVLS
 import numpy as np
 from typing import List, Optional
+
+try:
+    from topograph import TopographLoss
+    TOPOGRAPH_AVAILABLE = True
+except ImportError:
+    TOPOGRAPH_AVAILABLE = False
+
+try:
+    from betti_matching_loss import compute_betti_matching_loss
+    BETTI_MATCHING_AVAILABLE = True
+except ImportError:
+    BETTI_MATCHING_AVAILABLE = False
+
+
+class CrossEntropyLossWrapper(nn.Module):
+    """Wrapper around CrossEntropyLoss that returns (loss, components_dict)"""
+    
+    def __init__(self, ignore_index: int = -1):
+        super().__init__()
+        self.ce_loss = nn.CrossEntropyLoss(ignore_index=ignore_index)
+    
+    def forward(self, predictions: torch.Tensor, targets: torch.Tensor, **kwargs):
+        """
+        Args:
+            predictions: (B, C, H, W, D) - logits
+            targets: (B, H, W, D) - class indices
+            **kwargs: Additional arguments (ignored for this loss)
+        
+        Returns:
+            Tuple of (loss, components_dict) where components_dict contains the loss components
+        """
+        loss = self.ce_loss(predictions, targets.long())
+        return loss, {'ce': loss}
+
 
 class FocalLoss(nn.Module):
     """Focal Loss for addressing class imbalance"""
@@ -19,11 +52,15 @@ class FocalLoss(nn.Module):
         self.reduction = reduction
         self.ignore_index = ignore_index
     
-    def forward(self, predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    def forward(self, predictions: torch.Tensor, targets: torch.Tensor, **kwargs):
         """
         Args:
             predictions: (B, C, H, W, D) - logits
             targets: (B, H, W, D) - class indices
+            **kwargs: Additional arguments (ignored for this loss)
+        
+        Returns:
+            Tuple of (loss, components_dict) where components_dict contains the loss components
         """
         predictions = predictions.float()
         
@@ -38,20 +75,25 @@ class FocalLoss(nn.Module):
         # Apply valid mask for manual reduction
         if self.reduction == 'mean':
             # Only average over valid pixels
-            return (focal_loss * valid_mask).sum() / (valid_mask.sum() + 1e-8)
+            loss = (focal_loss * valid_mask).sum() / (valid_mask.sum() + 1e-8)
         elif self.reduction == 'sum':
-            return (focal_loss * valid_mask).sum()
+            loss = (focal_loss * valid_mask).sum()
         else:
-            return focal_loss
+            loss = focal_loss
+        
+        return loss, {'focal': loss}
 
 
 class DiceLoss(nn.Module):
     """
-    Dice Loss with optional Dice++ support.
-    Computes 1 - Dice (or 1 - Dice++)
+    Dice Loss with optional Dice++ and clDice support.
+    Computes 1 - Dice (or 1 - Dice++), optionally combined with clDice.
     
     When plus_plus=True and use_fixed_grad_softmax=True, the Dice++ specific
     gradient correction is automatically applied (requires exponential_correction >= 20).
+    
+    When cldice_alpha > 0, combines standard Dice with clDice (skeleton-based Dice):
+        loss = (1 - cldice_alpha) * dice_loss + cldice_alpha * cldice_loss
     """
     def __init__(
         self,
@@ -62,7 +104,8 @@ class DiceLoss(nn.Module):
         exponential_correction: Optional[int] = None,
         plus_plus: bool = False,
         gamma: float = 2.0,
-        tversky_beta: float = 0.5
+        tversky_beta: float = 0.5,
+        cldice_alpha: float = 0.0
     ):
         super().__init__()
         self.smooth = smooth
@@ -73,6 +116,11 @@ class DiceLoss(nn.Module):
         self.plus_plus = plus_plus
         self.gamma = gamma
         self.tversky_beta = tversky_beta
+        self.cldice_alpha = cldice_alpha
+        
+        # Initialize skeletonizer if clDice is enabled
+        if self.cldice_alpha > 0:
+            self.soft_skeletonize = SoftSkeletonize(num_iter=10)
         
         # Validation for dice_plus_plus with fixed_grad_softmax
         if plus_plus and use_fixed_grad_softmax:
@@ -141,12 +189,32 @@ class DiceLoss(nn.Module):
         fp = fp.sum(dim=2)
         fn = fn.sum(dim=2)
         dice_score = (2.0 * tp + self.smooth) / (2.0 * tp + fp + fn + self.smooth)
+        dice_loss = 1.0 - dice_score.mean()
+        
+        # Add clDice component if enabled
+        if self.cldice_alpha > 0:
+            # For clDice, we need probabilities (not one-hot)
+            # Use the same probs we computed earlier
+            # clDice expects (B, C, H, W, D) format
+            skel_pred = self.soft_skeletonize(probs[:, start_idx:])
+            skel_true = self.soft_skeletonize(targets_one_hot[:, start_idx:])
             
-        return 1.0 - dice_score.mean()
+            # Compute clDice: precision and sensitivity based on skeletons
+            tprec = (torch.sum(skel_pred * targets_one_hot[:, start_idx:]) + self.smooth) / (torch.sum(skel_pred) + self.smooth)
+            tsens = (torch.sum(skel_true * probs[:, start_idx:]) + self.smooth) / (torch.sum(skel_true) + self.smooth)
+            cl_dice = 1.0 - 2.0 * (tprec * tsens) / (tprec + tsens + self.smooth)
+            
+            # Combine dice and clDice (scaled components)
+            scaled_dice = (1.0 - self.cldice_alpha) * dice_loss
+            scaled_cldice = self.cldice_alpha * cl_dice
+            total_loss = scaled_dice + scaled_cldice
+            return total_loss, {'dice': scaled_dice, 'cldice': scaled_cldice}
+        
+        return dice_loss, {'dice': dice_loss}
 
 
 class CombinedLoss(nn.Module):
-    """Combined Dice (or Dice++/Tversky) + CrossEntropy Loss"""
+    """Combined Dice (or Dice++/Tversky) + CrossEntropy Loss with optional clDice and weight maps"""
     
     def __init__(
         self,
@@ -159,12 +227,21 @@ class CombinedLoss(nn.Module):
         exponential_correction: Optional[int] = None,
         dice_plus_plus: bool = False,
         gamma: float = 2.0,
-        tversky_beta: float = 0.5
+        tversky_beta: float = 0.5,
+        cldice_alpha: float = 0.0,
+        use_weight_map: bool = False,
+        weight_map_scale: float = 1.0,
+        weight_map_bias: float = 1.0,
     ):
         super().__init__()
         self.dice_weight = dice_weight
         self.ce_weight = ce_weight
-        self.ce_loss = nn.CrossEntropyLoss(ignore_index=ignore_index)
+        self.ignore_index = ignore_index
+        self.use_weight_map = use_weight_map
+        self.weight_map_scale = weight_map_scale
+        self.weight_map_bias = weight_map_bias
+        # Use reduction='none' when using weight maps to apply per-pixel weighting
+        self.ce_loss = nn.CrossEntropyLoss(ignore_index=ignore_index, reduction='none' if use_weight_map else 'mean')
         self.dice_loss = DiceLoss(
             smooth=smooth,
             include_background=include_background,
@@ -173,29 +250,249 @@ class CombinedLoss(nn.Module):
             exponential_correction=exponential_correction,
             plus_plus=dice_plus_plus,
             gamma=gamma,
-            tversky_beta=tversky_beta
+            tversky_beta=tversky_beta,
+            cldice_alpha=cldice_alpha,
         )
-    
-    def forward(self, predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+
+    def forward(self, predictions: torch.Tensor, targets: torch.Tensor, weight_map: Optional[torch.Tensor] = None, **kwargs):
         """
         Args:
             predictions: (B, C, H, W, D) - logits
             targets: (B, H, W, D) - class indices
+            weight_map: (B, 1, H, W, D) or (B, H, W, D) - per-pixel weights for CE loss (optional)
+            **kwargs: Additional arguments (e.g., valid_bounds) passed to subclasses
+        
+        Returns:
+            Tuple of (loss, components_dict) where components_dict contains scaled loss components
         """
+        components = {}
+        total_loss = 0.0
+        
         # Only compute CE loss if it has non-zero weight
         if self.ce_weight > 0:
-            ce = self.ce_loss(predictions, targets.long())
-        else:
-            ce = 0.0
+            ce_per_pixel = self.ce_loss(predictions, targets.long())
+            
+            if self.use_weight_map and weight_map is not None:
+                # Apply per-pixel weighting
+                # weight_map shape: (B, 1, H, W, D) or (B, H, W, D)
+                # ce_per_pixel shape: (B, H, W, D)
+                if weight_map.dim() == 5 and weight_map.size(1) == 1:
+                    weight_map = weight_map.squeeze(1)
+                
+                # Mask for valid pixels (not ignored)
+                valid_mask = (targets != self.ignore_index).float()
+                
+                # Apply weights and compute mean over valid pixels
+                weighted_ce = ce_per_pixel * (weight_map * self.weight_map_scale + self.weight_map_bias)
+                ce = (weighted_ce * valid_mask).sum() / (valid_mask.sum() + 1e-8)
+            else:
+                # Without weight map, ce_per_pixel is already reduced to scalar
+                ce = ce_per_pixel if ce_per_pixel.dim() == 0 else ce_per_pixel.mean()
+            
+            scaled_ce = self.ce_weight * ce
+            components['ce'] = scaled_ce
+            total_loss = total_loss + scaled_ce
         
         # Only compute Dice loss if it has non-zero weight
         if self.dice_weight > 0:
-            dice = self.dice_loss(predictions, targets)
-        else:
-            dice = 0.0
-        
-        return self.dice_weight * dice + self.ce_weight * ce
+            dice, dice_components = self.dice_loss(predictions, targets)
+            # Add scaled dice components to our components dict
+            for key, value in dice_components.items():
+                components[key] = self.dice_weight * value
+            total_loss = total_loss + self.dice_weight * dice
 
+        return total_loss, components
+
+
+class DiceTopographLoss(CombinedLoss):
+    """Combined Dice (or Dice++/Tversky) + CrossEntropy + Topograph Loss.
+    
+    Extends CombinedLoss with Topograph loss, which penalizes topologically critical 
+    voxels - those that cause changes in connected components (false splits, false 
+    merges, etc.).
+    """
+    
+    def __init__(
+        self,
+        dice_weight: float = 1.0,
+        ce_weight: float = 1.0,
+        topograph_weight: float = 0.1,
+        smooth: float = 1e-5,
+        include_background: bool = False,
+        ignore_index: int = -1,
+        use_fixed_grad_softmax: bool = False,
+        exponential_correction: Optional[int] = None,
+        dice_plus_plus: bool = False,
+        gamma: float = 2.0,
+        tversky_beta: float = 0.5,
+        cldice_alpha: float = 0.0,
+        # Topograph-specific parameters
+        topograph_num_processes: int = 4,
+        topograph_thres_var: float = 0.0,
+        topograph_aggregation: str = "mean",
+        topograph_error_type: str = "false_positives",
+        topograph_debug: bool = False,
+        use_weight_map: bool = False,
+    ):
+        if not TOPOGRAPH_AVAILABLE:
+            raise ImportError("TopographLoss requires the 'topograph' module. Install it to use combined_topograph loss.")
+        super().__init__(
+            dice_weight=dice_weight,
+            ce_weight=ce_weight,
+            smooth=smooth,
+            include_background=include_background,
+            ignore_index=ignore_index,
+            use_fixed_grad_softmax=use_fixed_grad_softmax,
+            exponential_correction=exponential_correction,
+            dice_plus_plus=dice_plus_plus,
+            gamma=gamma,
+            tversky_beta=tversky_beta,
+            cldice_alpha=cldice_alpha,
+            use_weight_map=use_weight_map,
+        )
+        self.topograph_weight = topograph_weight
+        self.topograph_loss = TopographLoss(
+            num_processes=topograph_num_processes,
+            aggregation=topograph_aggregation,
+            thres_var=topograph_thres_var,
+            include_background=include_background,
+            sphere=False,
+            ignore_index=ignore_index,
+            debug=topograph_debug,
+            error_type=topograph_error_type,
+        )
+    
+    def forward(self, predictions: torch.Tensor, targets: torch.Tensor, **kwargs):
+        """
+        Args:
+            predictions: (B, C, H, W, D) - logits
+            targets: (B, H, W, D) - class indices
+            **kwargs: Additional arguments (ignored for this loss)
+        
+        Returns:
+            Tuple of (loss, components_dict) where components_dict contains scaled loss components
+        """
+        total_loss, components = super().forward(predictions, targets, **kwargs)
+
+        # Compute Topograph loss if it has non-zero weight
+        if self.topograph_weight > 0:
+            # Ignore_index is handled inside TopographLoss
+            
+            topograph = self.topograph_loss(predictions, targets)
+            scaled_topograph = self.topograph_weight * topograph
+            components['topograph'] = scaled_topograph
+            total_loss = total_loss + scaled_topograph
+        
+        return total_loss, components
+
+
+class DiceBettiMatchingLoss(CombinedLoss):
+    """Combined Dice (or Dice++/Tversky) + CrossEntropy + Betti Matching Loss.
+    
+    Extends CombinedLoss with Betti Matching loss, which uses persistent homology 
+    to match topological features between prediction and target, penalizing both 
+    matched pairs that differ and unmatched topological features.
+    
+    Note: Betti matching requires binary segmentation (2 classes). For multi-class,
+    the foreground class (class 1) probabilities are used.
+    """
+    
+    def __init__(
+        self,
+        dice_weight: float = 1.0,
+        ce_weight: float = 1.0,
+        betti_weight: float = 0.1,
+        smooth: float = 1e-5,
+        include_background: bool = False,
+        ignore_index: int = -1,
+        use_fixed_grad_softmax: bool = False,
+        exponential_correction: Optional[int] = None,
+        dice_plus_plus: bool = False,
+        gamma: float = 2.0,
+        tversky_beta: float = 0.5,
+        cldice_alpha: float = 0.0,
+        # Betti matching-specific parameters
+        betti_cpu_batch_size: int = 16,
+        subsampling_size: int = None,
+        subsampling_mode: str = "random_crop",
+        use_weight_map: bool = False,
+    ):
+        if not BETTI_MATCHING_AVAILABLE:
+            raise ImportError("DiceBettiMatchingLoss requires the 'betti_matching_loss' module. Install it to use combined_betti loss.")
+        super().__init__(
+            dice_weight=dice_weight,
+            ce_weight=ce_weight,
+            smooth=smooth,
+            include_background=include_background,
+            ignore_index=ignore_index,
+            use_fixed_grad_softmax=use_fixed_grad_softmax,
+            exponential_correction=exponential_correction,
+            dice_plus_plus=dice_plus_plus,
+            gamma=gamma,
+            tversky_beta=tversky_beta,
+            cldice_alpha=cldice_alpha,
+            use_weight_map=use_weight_map,
+        )
+        self.betti_weight = betti_weight
+        self.betti_cpu_batch_size = betti_cpu_batch_size
+        self.subsampling_size = subsampling_size
+        self.subsampling_mode = subsampling_mode
+    
+    def forward(self, predictions: torch.Tensor, targets: torch.Tensor, valid_bounds: Optional[List] = None, weight_map: Optional[torch.Tensor] = None, **kwargs):
+        """
+        Args:
+            predictions: (B, C, D, H, W) - logits
+            targets: (B, D, H, W) - class indices (0 or 1 for binary segmentation)
+            valid_bounds: Optional list of precomputed valid region bounds per sample.
+                         Each element is ((w_min, w_max), (h_min, h_max), (d_min, d_max)) or None.
+            weight_map: (B, 1, H, W, D) or (B, H, W, D) - per-pixel weights for CE loss (optional)
+            **kwargs: Additional arguments passed to parent
+        
+        Returns:
+            Tuple of (loss, components_dict) where components_dict contains scaled loss components
+        """
+        total_loss, components = super().forward(predictions, targets, valid_bounds=valid_bounds, weight_map=weight_map, **kwargs)
+        
+        # Compute Betti matching loss if it has non-zero weight
+        if self.betti_weight > 0:
+            # Convert predictions to probabilities for foreground class
+            # Betti matching expects (B, 1, *spatial) tensors with values in [0, 1]
+            probs = F.softmax(predictions, dim=1)
+            
+            # Use foreground probability (class 1) for Betti matching
+            # Shape: (B, 1, D, H, W)
+            pred_fg = probs[:, 1:2, ...]
+            
+            # Convert targets to same format: (B, 1, D, H, W) with values 0 or 1
+            target_fg = (targets == 1).float().unsqueeze(1)
+            
+            # Create valid_mask for filtering coordinates in ignore regions
+            # valid_mask is True where target is NOT the ignore_index
+            valid_mask = (targets != self.ignore_index).float().unsqueeze(1)
+
+            # print ratio of valid voxels in valid_mask
+            valid_ratio = valid_mask.mean().item()
+            print(f"[Betti Matching] Valid voxel ratio: {valid_ratio:.4f}", flush=True)
+            
+            betti_losses = compute_betti_matching_loss(
+                prediction=pred_fg,
+                target=target_fg,
+                cpu_batch_size=self.betti_cpu_batch_size,
+                sigmoid=False,  # Already applied softmax
+                relative=False,
+                valid_mask=valid_mask,
+                valid_bounds=valid_bounds,
+                subsampling_size=self.subsampling_size,
+                subsampling_mode=self.subsampling_mode
+            )
+            
+            betti_loss = torch.mean(torch.cat(betti_losses))
+            scaled_betti = self.betti_weight * betti_loss
+            components['betti_matching'] = scaled_betti
+            
+            total_loss = total_loss + scaled_betti
+        
+        return total_loss, components
 
 class DeepSupervisionLoss(nn.Module):
     """Deep supervision loss for multi-scale outputs"""
@@ -211,13 +508,19 @@ class DeepSupervisionLoss(nn.Module):
         self.weights = weights
         self.downsampling_scales = downsampling_scales or [1, 2, 4, 8, 16]
     
-    def forward(self, predictions: List[torch.Tensor], targets: torch.Tensor) -> torch.Tensor:
+    def forward(self, predictions: List[torch.Tensor], targets: torch.Tensor, weight_map: Optional[torch.Tensor] = None, **kwargs):
         """
         Args:
             predictions: List of predictions at different scales [(B, C, H, W, D), ...]
             targets: (B, H, W, D) - class indices
+            weight_map: (B, 1, H, W, D) or (B, H, W, D) - per-pixel weights for CE loss (optional)
+            **kwargs: Additional arguments (e.g., valid_bounds) passed to loss_fn
+        
+        Returns:
+            Tuple of (loss, components_dict) where components_dict contains aggregated scaled loss components
         """
         total_loss = 0.0
+        aggregated_components = {}
         
         for i, (pred, weight) in enumerate(zip(predictions, self.weights)):
             if weight == 0:
@@ -231,8 +534,21 @@ class DeepSupervisionLoss(nn.Module):
                     scale_factor=1.0/scale,
                     mode='nearest'
                 ).squeeze(1).long()
+                
+                # Downsample weight_map if provided
+                if weight_map is not None:
+                    wm = weight_map if weight_map.dim() == 5 else weight_map.unsqueeze(1)
+                    weight_map_scaled = F.interpolate(
+                        wm.float(),
+                        scale_factor=1.0/scale,
+                        mode='trilinear',
+                        align_corners=False
+                    )
+                else:
+                    weight_map_scaled = None
             else:
                 target_scaled = targets
+                weight_map_scaled = weight_map
             
             # Resize prediction to match target if needed
             if pred.shape[2:] != target_scaled.shape[1:]:
@@ -245,17 +561,40 @@ class DeepSupervisionLoss(nn.Module):
             else:
                 pred_resized = pred
             
-            loss = self.loss_fn(pred_resized, target_scaled)
+            # Only pass valid_bounds to the main resolution (scale 0)
+            # For downsampled scales, bounds would need adjustment
+            if i == 0:
+                loss, components = self.loss_fn(pred_resized, target_scaled, weight_map=weight_map_scaled, **kwargs)
+            else:
+                # Pass downsampled weight_map but not valid_bounds
+                loss, components = self.loss_fn(pred_resized, target_scaled, weight_map=weight_map_scaled)
             total_loss += weight * loss
+            
+            # Aggregate components across scales (weighted sum)
+            for key, value in components.items():
+                if key not in aggregated_components:
+                    aggregated_components[key] = 0.0
+                aggregated_components[key] = aggregated_components[key] + weight * value
         
-        return total_loss
+        return total_loss, aggregated_components
 
 
-def get_loss_function(config, device) -> nn.Module:
+def get_loss_function(config) -> nn.Module:
     """Get loss function based on configuration"""
     ignore_index = getattr(config.training, 'ignore_index', -1)
     use_fixed_grad_softmax = getattr(config.training, 'use_fixed_grad_softmax', False)
     exponential_correction = getattr(config.training, 'exponential_correction', None)
+    cldice_alpha = getattr(config.training, 'cldice_alpha', 0.0)
+    use_weight_map = getattr(config.training, 'use_weight_map', False)
+    
+    # Topograph-specific config parameters
+    topograph_weight = getattr(config.training, 'topograph_weight', 0.1)
+    topograph_num_processes = getattr(config.training, 'topograph_num_processes', 4)
+    topograph_thres_var = getattr(config.training, 'topograph_thres_var', 0.0)
+    topograph_aggregation = getattr(config.training, 'topograph_aggregation', 'mean')
+    topograph_debug = getattr(config.training, 'topograph_debug', False)
+    topograph_error_type = getattr(config.training, 'topograph_error_type', 'all')
+
     
     if config.training.loss_function == "dice":
         return CombinedLoss(
@@ -266,18 +605,15 @@ def get_loss_function(config, device) -> nn.Module:
             ignore_index=ignore_index,
             use_fixed_grad_softmax=use_fixed_grad_softmax,
             exponential_correction=exponential_correction,
-            dice_plus_plus=False
+            dice_plus_plus=False,
+            cldice_alpha=cldice_alpha
         )
     
     elif config.training.loss_function == "ce":
         # throw error if use_fixed_grad_softmax is set
-        weights = getattr(config.training, 'class_weights', None)
-        if weights is not None:
-            weights = torch.tensor(weights, dtype=torch.float32).to(device)
-        print("Class weights for CE loss:", weights)
         if use_fixed_grad_softmax:
             raise NotImplementedError("use_fixed_grad_softmax is not implemented for CrossEntropy loss")
-        return nn.CrossEntropyLoss(ignore_index=ignore_index, weight=weights)
+        return CrossEntropyLossWrapper(ignore_index=ignore_index)
     
     elif config.training.loss_function == "focal":
         return FocalLoss(alpha=1.0, gamma=2.0, ignore_index=ignore_index)
@@ -291,7 +627,9 @@ def get_loss_function(config, device) -> nn.Module:
             ignore_index=ignore_index,
             use_fixed_grad_softmax=use_fixed_grad_softmax,
             exponential_correction=exponential_correction,
-            dice_plus_plus=False
+            dice_plus_plus=False,
+            cldice_alpha=cldice_alpha,
+            use_weight_map=use_weight_map,
         )
     
     elif config.training.loss_function == "dice_plus_plus":
@@ -305,7 +643,8 @@ def get_loss_function(config, device) -> nn.Module:
             use_fixed_grad_softmax=use_fixed_grad_softmax,
             exponential_correction=exponential_correction,
             dice_plus_plus=True,
-            gamma=gamma
+            gamma=gamma,
+            cldice_alpha=cldice_alpha
         )
     
     elif config.training.loss_function == "dice_plus_plus_ce":
@@ -319,7 +658,9 @@ def get_loss_function(config, device) -> nn.Module:
             use_fixed_grad_softmax=use_fixed_grad_softmax,
             exponential_correction=exponential_correction,
             dice_plus_plus=True,
-            gamma=gamma
+            gamma=gamma,
+            cldice_alpha=cldice_alpha,
+            use_weight_map=use_weight_map,
         )
     
     elif config.training.loss_function == "tversky":
@@ -333,7 +674,8 @@ def get_loss_function(config, device) -> nn.Module:
             use_fixed_grad_softmax=use_fixed_grad_softmax,
             exponential_correction=exponential_correction,
             dice_plus_plus=False,
-            tversky_beta=tversky_beta
+            tversky_beta=tversky_beta,
+            cldice_alpha=cldice_alpha
         )
     
     elif config.training.loss_function == "tversky_ce":
@@ -347,22 +689,56 @@ def get_loss_function(config, device) -> nn.Module:
             use_fixed_grad_softmax=use_fixed_grad_softmax,
             exponential_correction=exponential_correction,
             dice_plus_plus=False,
-            tversky_beta=tversky_beta
+            tversky_beta=tversky_beta,
+            cldice_alpha=cldice_alpha,
+            use_weight_map=use_weight_map,
         )
-    elif config.training.loss_function == "svls":
-        sigma = getattr(config.training, 'sigma', 1.0)
-        weights = getattr(config.training, 'class_weights', None)
-        if weights is not None:
-            weights = torch.tensor(weights, dtype=torch.float32).to(device)
-        num_classes = config.data.num_classes # Ensure this exists
-        print("Class weights for SVLS loss:", weights)
-        return CELossWithSVLS(
-            classes=num_classes,
-            sigma=sigma,
+    
+    elif config.training.loss_function == "combined_topograph":
+        return DiceTopographLoss(
+            dice_weight=config.training.dice_weight,
+            ce_weight=config.training.ce_weight,
+            topograph_weight=topograph_weight,
+            smooth=1e-5,
+            include_background=False,
             ignore_index=ignore_index,
-            weights=weights
+            use_fixed_grad_softmax=False,
+            exponential_correction=None,
+            dice_plus_plus=False,
+            tversky_beta=0.5, # 0.5 for standard Dice
+            cldice_alpha=0.0,
+            topograph_num_processes=topograph_num_processes,
+            topograph_thres_var=topograph_thres_var,
+            topograph_aggregation=topograph_aggregation,
+            topograph_debug=topograph_debug,
+            topograph_error_type=topograph_error_type,
+            use_weight_map=use_weight_map,
         )
+    
+    elif config.training.loss_function == "combined_betti":
+        betti_weight = getattr(config.training, 'betti_weight', 0.1)
+        betti_cpu_batch_size = getattr(config.training, 'betti_cpu_batch_size', 16)
+        betti_subsampling_size = getattr(config.training, 'betti_subsampling_size', None)
+        betti_subsampling_mode = getattr(config.training, 'betti_subsampling_mode', "random_crop")
 
+        return DiceBettiMatchingLoss(
+            dice_weight=config.training.dice_weight,
+            ce_weight=config.training.ce_weight,
+            betti_weight=betti_weight,
+            smooth=1e-5,
+            include_background=False,
+            ignore_index=ignore_index,
+            use_fixed_grad_softmax=False,
+            exponential_correction=None,
+            dice_plus_plus=False,
+            tversky_beta=0.5, # 0.5 for standard Dice
+            cldice_alpha=0.0,
+            betti_cpu_batch_size=betti_cpu_batch_size,
+            subsampling_size=betti_subsampling_size,
+            subsampling_mode=betti_subsampling_mode,
+            use_weight_map=use_weight_map,
+        )
+    
     else:
         raise ValueError(f"Unknown loss function: {config.training.loss_function}")
 
@@ -476,3 +852,107 @@ class FixedGradSoftmax(torch.autograd.Function):
         grad_logits_fg = weight * coupling
 
         return torch.cat([grad_logits_bg, grad_logits_fg], dim=1), None, None, None
+
+class soft_cldice(nn.Module):
+    def __init__(self, iter_=3, smooth = 1., exclude_background=False):
+        super(soft_cldice, self).__init__()
+        self.iter = iter_
+        self.smooth = smooth
+        self.soft_skeletonize = SoftSkeletonize(num_iter=10)
+        self.exclude_background = exclude_background
+
+    def forward(self, y_true, y_pred):
+        if self.exclude_background:
+            y_true = y_true[:, 1:, :, :]
+            y_pred = y_pred[:, 1:, :, :]
+        skel_pred = self.soft_skeletonize(y_pred)
+        skel_true = self.soft_skeletonize(y_true)
+        tprec = (torch.sum(torch.multiply(skel_pred, y_true))+self.smooth)/(torch.sum(skel_pred)+self.smooth)    
+        tsens = (torch.sum(torch.multiply(skel_true, y_pred))+self.smooth)/(torch.sum(skel_true)+self.smooth)    
+        cl_dice = 1.- 2.0*(tprec*tsens)/(tprec+tsens)
+        return cl_dice
+
+
+def soft_dice(y_true, y_pred):
+    """[function to compute dice loss]
+
+    Args:
+        y_true ([float32]): [ground truth image]
+        y_pred ([float32]): [predicted image]
+
+    Returns:
+        [float32]: [loss value]
+    """
+    smooth = 1
+    intersection = torch.sum((y_true * y_pred))
+    coeff = (2. *  intersection + smooth) / (torch.sum(y_true) + torch.sum(y_pred) + smooth)
+    return (1. - coeff)
+
+
+class soft_dice_cldice(nn.Module):
+    def __init__(self, iter_=3, alpha=0.5, smooth = 1., exclude_background=False):
+        super(soft_dice_cldice, self).__init__()
+        self.iter = iter_
+        self.smooth = smooth
+        self.alpha = alpha
+        self.soft_skeletonize = SoftSkeletonize(num_iter=10)
+        self.exclude_background = exclude_background
+
+    def forward(self, y_true, y_pred):
+        if self.exclude_background:
+            y_true = y_true[:, 1:, :, :]
+            y_pred = y_pred[:, 1:, :, :]
+        dice = soft_dice(y_true, y_pred)
+        skel_pred = self.soft_skeletonize(y_pred)
+        skel_true = self.soft_skeletonize(y_true)
+        tprec = (torch.sum(torch.multiply(skel_pred, y_true))+self.smooth)/(torch.sum(skel_pred)+self.smooth)    
+        tsens = (torch.sum(torch.multiply(skel_true, y_pred))+self.smooth)/(torch.sum(skel_true)+self.smooth)    
+        cl_dice = 1.- 2.0*(tprec*tsens)/(tprec+tsens)
+        return (1.0-self.alpha)*dice+self.alpha*cl_dice
+
+class SoftSkeletonize(torch.nn.Module):
+
+    def __init__(self, num_iter=10):
+
+        super(SoftSkeletonize, self).__init__()
+        self.num_iter = num_iter
+
+    def soft_erode(self, img):
+
+        if len(img.shape)==4:
+            p1 = -F.max_pool2d(-img, (3,1), (1,1), (1,0))
+            p2 = -F.max_pool2d(-img, (1,3), (1,1), (0,1))
+            return torch.min(p1,p2)
+        elif len(img.shape)==5:
+            p1 = -F.max_pool3d(-img,(3,1,1),(1,1,1),(1,0,0))
+            p2 = -F.max_pool3d(-img,(1,3,1),(1,1,1),(0,1,0))
+            p3 = -F.max_pool3d(-img,(1,1,3),(1,1,1),(0,0,1))
+            return torch.min(torch.min(p1, p2), p3)
+
+    def soft_dilate(self, img):
+
+        if len(img.shape)==4:
+            return F.max_pool2d(img, (3,3), (1,1), (1,1))
+        elif len(img.shape)==5:
+            return F.max_pool3d(img,(3,3,3),(1,1,1),(1,1,1))
+
+    def soft_open(self, img):
+        
+        return self.soft_dilate(self.soft_erode(img))
+
+    def soft_skel(self, img):
+
+        img1 = self.soft_open(img)
+        skel = F.relu(img-img1)
+
+        for j in range(self.num_iter):
+            img = self.soft_erode(img)
+            img1 = self.soft_open(img)
+            delta = F.relu(img-img1)
+            skel = skel + F.relu(delta - skel * delta)
+
+        return skel
+
+    def forward(self, img):
+
+        return self.soft_skel(img)

@@ -8,4 +8,5 @@ wandb
 *.log
 *.nfs*
 *.code-workspace
+*.json
 /sweep_configs

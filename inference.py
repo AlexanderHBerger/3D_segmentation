@@ -531,7 +531,8 @@ class InferenceDataset(Dataset):
         verbose: bool = False,
         save_preprocessed: bool = False,
         output_dir: Optional[Path] = None,
-        use_preprocessed: bool = False
+        use_preprocessed: bool = False,
+        crop_margin_mm: float = 0.0
     ):
         """
         Initialize dataset.
@@ -543,6 +544,7 @@ class InferenceDataset(Dataset):
             save_preprocessed: Save preprocessed images
             output_dir: Directory to save preprocessed images
             use_preprocessed: If True, load from .npy files instead of NIfTI
+            crop_margin_mm: Margin in mm to crop from each side before inference (default: 0.0)
         """
         self.image_paths = image_paths
         self.target_spacing = target_spacing
@@ -550,6 +552,7 @@ class InferenceDataset(Dataset):
         self.save_preprocessed = save_preprocessed
         self.output_dir = output_dir
         self.use_preprocessed = use_preprocessed
+        self.crop_margin_mm = crop_margin_mm
     
     def __len__(self) -> int:
         return len(self.image_paths)
@@ -568,14 +571,48 @@ class InferenceDataset(Dataset):
         if self.use_preprocessed:
             # Load preprocessed .npy file
             data = np.load(image_path)
-            preprocessed_tensor = torch.from_numpy(data).float()
             
-            # For preprocessed data, we don't have properties for reverting
-            # Create minimal properties dict
-            properties = {
-                'preprocessed': True,
-                'original_path': str(image_path)
-            }
+            # Load properties.json if available
+            props_path = image_path.parent / image_path.name.replace('_data.npy', '_properties.json')
+            if props_path.exists():
+                import json
+                with open(props_path, 'r') as f:
+                    properties = json.load(f)
+                properties['preprocessed'] = True
+            else:
+                # Fallback if no properties file
+                properties = {
+                    'preprocessed': True,
+                    'original_path': str(image_path),
+                    'target_spacing': list(self.target_spacing)
+                }
+            
+            # Apply margin cropping if requested
+            if self.crop_margin_mm > 0:
+                # Get spacing from properties
+                spacing = tuple(properties.get('target_spacing', self.target_spacing))
+                
+                # Calculate crop amount in voxels for each dimension
+                crop_voxels = [int(np.ceil(self.crop_margin_mm / s)) for s in spacing]
+                
+                # Store original shape before cropping
+                original_shape = data.shape
+                
+                # Crop from each side (assuming data is (C, H, W, D))
+                data_cropped = data[
+                    :,
+                    crop_voxels[0]:-crop_voxels[0] if crop_voxels[0] > 0 else None,
+                    crop_voxels[1]:-crop_voxels[1] if crop_voxels[1] > 0 else None,
+                    crop_voxels[2]:-crop_voxels[2] if crop_voxels[2] > 0 else None
+                ]
+                
+                # Store crop info for later padding
+                properties['margin_crop_voxels'] = crop_voxels
+                properties['shape_before_crop'] = list(original_shape)
+                
+                data = data_cropped
+            
+            preprocessed_tensor = torch.from_numpy(data).float()
         else:
             # Preprocess the case on-the-fly
             preprocessed_tensor, properties = preprocess_case_for_inference(
@@ -699,7 +736,9 @@ class Predictor:
         num_postprocess_workers: int = 2,
         use_preprocessed: bool = False,
         save_logits: bool = False,
-        save_probabilities: bool = False
+        save_probabilities: bool = False,
+        crop_margin_mm: float = 0.0,
+        patch_size: Optional[Tuple[int, int, int]] = None
     ):
         """
         Initialize predictor.
@@ -719,6 +758,8 @@ class Predictor:
             use_preprocessed: Load preprocessed .npy files instead of raw NIfTI (default: False)
             save_logits: Save logits in original image space (default: False)
             save_probabilities: Save probability maps (via softmax) in original image space (default: False)
+            crop_margin_mm: Margin in mm to crop from each side before inference (default: 0.0)
+            patch_size: Override patch size from config (default: None, use config value)
         """
         self.checkpoint_path = Path(checkpoint_path)
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
@@ -733,6 +774,8 @@ class Predictor:
         self.use_preprocessed = use_preprocessed
         self.save_logits = save_logits
         self.save_probabilities = save_probabilities
+        self.crop_margin_mm = crop_margin_mm
+        self.patch_size_override = patch_size
 
         logger.info(f"Loading checkpoint from {self.checkpoint_path}")
         
@@ -768,12 +811,18 @@ class Predictor:
         self.model = self.model.to(self.device)
         self.model.eval()
         
+        # Override patch size if specified
+        if self.patch_size_override is not None:
+            logger.info(f"Overriding patch size from config {self.config.data.patch_size} to {self.patch_size_override}")
+            self.config.data.patch_size = self.patch_size_override
+        
         # Set thread settings for optimal performance
         if self.device.type == 'cuda':
             torch.set_num_threads(1)
             torch.set_num_interop_threads(1)
         
         logger.info(f"Model ready on {self.device}")
+        logger.info(f"Using patch size: {self.config.data.patch_size}")
     
     def predict_case(
         self,
@@ -869,7 +918,8 @@ class Predictor:
         output_folder: Path,
         file_pattern: str = "*.nii.gz",
         max_samples: Optional[int] = None,
-        random_seed: int = 42
+        random_seed: int = 42,
+        sample_list: Optional[str] = None
     ):
         """
         Predict all cases in a folder using parallel data loading and background post-processing.
@@ -902,7 +952,39 @@ class Predictor:
         
         logger.info(f"\nFound {len(input_files)} files total")
         
-        # Randomly sample if max_samples is specified
+        # Filter by sample list if provided
+        if sample_list is not None:
+            sample_list_path = Path(sample_list)
+            if not sample_list_path.exists():
+                raise ValueError(f"Sample list file not found: {sample_list}")
+            
+            # Load case IDs from file
+            with open(sample_list_path, 'r') as f:
+                case_ids = set(line.strip() for line in f if line.strip())
+            
+            logger.info(f"Loaded {len(case_ids)} case IDs from {sample_list}")
+            
+            # Filter input files to only include cases in the list
+            # Handle different naming conventions: case_00000_data.npy, case_00000.nii.gz, case_00000_0000.nii.gz
+            filtered_files = []
+            for f in input_files:
+                # For .npy files: remove _data, don't remove _0000 (it's part of case ID)
+                # For .nii.gz files: remove _0000 suffix (BraTS naming), remove .nii extension
+                if f.suffix == '.npy':
+                    case_name = f.stem.replace('_data', '')
+                else:
+                    case_name = f.stem.replace('_0000', '').replace('.nii', '')
+                
+                if case_name in case_ids:
+                    filtered_files.append(f)
+            
+            input_files = filtered_files
+            logger.info(f"Filtered to {len(input_files)} files matching sample list")
+            
+            if len(input_files) == 0:
+                raise ValueError(f"No files matched the case IDs in sample list {sample_list}")
+        
+        # Randomly sample if max_samples is specified (applied after sample_list filtering)
         if max_samples is not None and max_samples < len(input_files):
             import random
             random.seed(random_seed)
@@ -920,7 +1002,8 @@ class Predictor:
             verbose=False,  # Disable per-image verbose in workers
             save_preprocessed=self.save_preprocessed,
             output_dir=output_folder if self.save_preprocessed else None,
-            use_preprocessed=self.use_preprocessed
+            use_preprocessed=self.use_preprocessed,
+            crop_margin_mm=self.crop_margin_mm
         )
         
         dataloader = DataLoader(
@@ -946,8 +1029,13 @@ class Predictor:
             for tensors_batch, properties_batch, paths_batch in dataloader:
                 # Process each item in the batch (batch_size=1, so just one item)
                 for image_tensor, properties, input_path in zip(tensors_batch, properties_batch, paths_batch):
-                    # Get case name by removing _0000 suffix (matches labelsTs naming)
-                    case_name = input_path.name.replace('.nii.gz', '').replace('_0000', '')
+                    # Get case name by removing suffixes
+                    # For preprocessed: case_00000_data.npy -> case_00000
+                    # For raw NIfTI: case_00000_0000.nii.gz -> case_00000
+                    if input_path.suffix == '.npy':
+                        case_name = input_path.stem.replace('_data', '')
+                    else:
+                        case_name = input_path.name.replace('.nii.gz', '').replace('_0000', '')
                     output_path = output_folder / f"{case_name}.nii.gz"
                     
                     try:
@@ -982,17 +1070,86 @@ class Predictor:
                         
                         # Check if we can do postprocessing
                         if self.use_preprocessed or properties.get('preprocessed', False):
-                            # Preprocessed data - save logits directly without resampling
-                            logger.warning(f"Preprocessed data mode: saving argmax segmentation without resampling to original space")
-                            segmentation = torch.argmax(predicted_logits, dim=0).cpu().numpy().astype(np.uint8)
+                            # Preprocessed data - save in ROI space with proper spacing
+                            logger.info(f"  Preprocessed data mode: saving segmentation in ROI space (no resampling to original)")
                             
-                            # Save directly
+                            # Convert to numpy for processing
+                            logits = predicted_logits.numpy().astype(np.float32)
+                            
+                            # Pad logits back to original size if margin was cropped
+                            if 'margin_crop_voxels' in properties:
+                                crop_voxels = properties['margin_crop_voxels']
+                                
+                                # Pad logits: background class gets high value, foreground classes get low value
+                                # This ensures argmax will select background (class 0) in padded regions
+                                pad_width = [(0, 0)] + [(cv, cv) for cv in crop_voxels]  # [(0,0), (x,x), (y,y), (z,z)]
+                                
+                                # Pad each class channel with appropriate values
+                                logits_padded = np.pad(
+                                    logits,
+                                    pad_width=pad_width,
+                                    mode='constant',
+                                    constant_values=0  # Will be overridden per channel below
+                                )
+                                
+                                # Set appropriate values for padded regions
+                                dtype_info = np.finfo(np.float32)
+                                # Create a mask for padded regions
+                                mask = np.ones(logits_padded.shape[1:], dtype=bool)
+                                mask[
+                                    crop_voxels[0]:-crop_voxels[0] if crop_voxels[0] > 0 else slice(None),
+                                    crop_voxels[1]:-crop_voxels[1] if crop_voxels[1] > 0 else slice(None),
+                                    crop_voxels[2]:-crop_voxels[2] if crop_voxels[2] > 0 else slice(None)
+                                ] = False
+                                
+                                # Background class (channel 0): high logit in padded regions
+                                logits_padded[0, mask] = dtype_info.max
+                                # Foreground classes: low logit in padded regions
+                                for c in range(1, logits_padded.shape[0]):
+                                    logits_padded[c, mask] = dtype_info.min
+                                
+                                logits = logits_padded
+                                logger.info(f"  Padded logits back to shape {logits.shape}")
+                            
+                            # Compute segmentation from padded logits
+                            segmentation = np.argmax(logits, axis=0).astype(np.int8)
+                            
+                            # Get spacing from properties (target_spacing used during preprocessing)
+                            target_spacing = properties.get('target_spacing', list(self.config.data.target_spacing))
+                            if isinstance(target_spacing, list):
+                                target_spacing = tuple(target_spacing)
+                            
+                            # Create affine with proper spacing for visualization
+                            affine = np.diag([*target_spacing, 1.0])
+                            
+                            # Save segmentation in ROI space
                             output_path.parent.mkdir(parents=True, exist_ok=True)
-                            seg_nii = nib.Nifti1Image(
-                                segmentation,
-                                affine=properties.get('resampled_affine', np.eye(4))
-                            )
+                            seg_nii = nib.Nifti1Image(segmentation, affine=affine)
                             nib.save(seg_nii, output_path)
+                            
+                            logger.info(f"  Saved {case_name}: shape={segmentation.shape}, spacing={target_spacing}")
+                            
+                            # Save logits if requested
+                            if self.save_logits:
+                                # Save as 4D NIfTI (transpose to X, Y, Z, C)
+                                logits_4d = np.transpose(logits, (1, 2, 3, 0))
+                                logits_nii = nib.Nifti1Image(logits_4d, affine=affine)
+                                logits_path = output_path.parent / f"{case_name}_logits.nii.gz"
+                                nib.save(logits_nii, logits_path)
+                                logger.info(f"  Saved logits to: {logits_path}")
+                            
+                            # Save probabilities if requested
+                            if self.save_probabilities:
+                                # Compute probabilities from padded logits via softmax
+                                probabilities = np.exp(logits - np.max(logits, axis=0, keepdims=True))
+                                probabilities = probabilities / np.sum(probabilities, axis=0, keepdims=True)
+                                
+                                # Save as 4D NIfTI (transpose to X, Y, Z, C)
+                                probs_4d = np.transpose(probabilities, (1, 2, 3, 0))
+                                probs_nii = nib.Nifti1Image(probs_4d, affine=affine)
+                                probs_path = output_path.parent / f"{case_name}_probabilities.nii.gz"
+                                nib.save(probs_nii, probs_path)
+                                logger.info(f"  Saved probabilities to: {probs_path}")
                             
                             # Update progress
                             with pbar_lock:
@@ -1158,6 +1315,13 @@ def main():
     )
     
     parser.add_argument(
+        '--sample_list',
+        type=str,
+        default=None,
+        help='Path to text file with list of case IDs to process (one per line)'
+    )
+    
+    parser.add_argument(
         '--save_logits',
         action='store_true',
         help='Save logits in original image space (4D NIfTI with class channels)'
@@ -1169,7 +1333,26 @@ def main():
         help='Save probability maps (via softmax) in original image space (4D NIfTI with class channels)'
     )
     
+    parser.add_argument(
+        '--crop_margin_mm',
+        type=float,
+        default=0.0,
+        help='Margin in mm to crop from each side before inference (reduces border artifacts, default: 0.0)'
+    )
+    
+    parser.add_argument(
+        '--patch_size',
+        type=int,
+        nargs=3,
+        default=None,
+        metavar=('H', 'W', 'D'),
+        help='Override patch size from config (e.g., --patch_size 128 128 128)'
+    )
+    
     args = parser.parse_args()
+    
+    # Convert patch_size to tuple if provided
+    patch_size = tuple(args.patch_size) if args.patch_size is not None else None
     
     # Create predictor
     predictor = Predictor(
@@ -1186,7 +1369,9 @@ def main():
         num_postprocess_workers=args.num_postprocess_workers,
         use_preprocessed=args.use_preprocessed,
         save_logits=args.save_logits,
-        save_probabilities=args.save_probabilities
+        save_probabilities=args.save_probabilities,
+        crop_margin_mm=args.crop_margin_mm,
+        patch_size=patch_size
     )
     
     # Run prediction
@@ -1195,7 +1380,8 @@ def main():
         output_folder=Path(args.output_folder),
         file_pattern=args.file_pattern,
         max_samples=args.max_samples,
-        random_seed=args.seed
+        random_seed=args.seed,
+        sample_list=args.sample_list
     )
 
 

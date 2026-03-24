@@ -9,7 +9,7 @@ import torch.optim as optim
 from torch.optim.lr_scheduler import PolynomialLR
 from torch.amp import GradScaler, autocast
 import wandb
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, List
 import time
 from pathlib import Path
 import json
@@ -22,21 +22,25 @@ from data_loading_native import DataManager, create_data_loaders
 from transforms_torchio import get_training_transforms, get_validation_transforms
 from losses import get_loss_function, get_deep_supervision_loss
 from metrics import MetricsCalculator
-from utils import (AverageMeter, save_checkpoint, load_checkpoint, EarlyStopping, extract_slice_with_lesion)
+from utils import (AverageMeter, save_checkpoint, load_checkpoint, EarlyStopping, extract_slice_with_foreground)
 from visualization import TrainingVisualizer
 from architectures import calculate_n_stages
 
 class Trainer:
     """Main training class"""
 
-    def __init__(self, config, fold: int, enable_visualization: bool = False, resume_id: Optional[str] = None):
+    def __init__(self, config, fold: int, enable_visualization: bool = False, resume_id: Optional[str] = None, warm_restart: bool = False, init_checkpoint: Optional[str] = None):
         self.fold = fold
         self.enable_visualization = enable_visualization
         self.run_id = resume_id
-        
+        self.warm_restart = warm_restart
+        self.init_checkpoint = init_checkpoint
+        self.train_on_all = getattr(config.data, 'train_on_all', False)
+
         # Determine output path if resuming (directory must exist for checkpoint loading)
         if self.run_id is not None:
-            self.output_dir = Path(config.output_dir) / f"fold_{fold}_{self.run_id}"
+            fold_label = "all" if self.train_on_all else str(fold)
+            self.output_dir = Path(config.output_dir) / f"fold_{fold_label}_{self.run_id}"
             if not self.output_dir.exists():
                 raise FileNotFoundError(f"Resume requested but directory does not exist: {self.output_dir}")
         
@@ -51,7 +55,7 @@ class Trainer:
         print(f"Using device: {self.device}")
         
         # Set random seeds
-        self.set_random_seeds(self.config.seed + fold)  # Different seed per fold
+        self.set_random_seeds(self.config.seed + (0 if self.train_on_all else fold))
         
         # Initialize mixed precision
         self.scaler = GradScaler('cuda' if self.device.type == 'cuda' else 'cpu') if self.config.mixed_precision else None
@@ -59,9 +63,14 @@ class Trainer:
         # Initialize model
         self.model = self._create_model()
         
+        # Load model weights from init_checkpoint if provided (for transfer learning / initialization only)
+        if self.init_checkpoint is not None:
+            self._load_model_weights_only(self.init_checkpoint)
+        
         # Initialize optimizer and scheduler
+        # Note: For warm restart, optimizer LR will be adjusted after checkpoint loading
         self.optimizer = self._create_optimizer()
-        self.scheduler = self._create_scheduler()
+        self.scheduler = None  # Will be created after checkpoint loading if needed
         
         # Initialize loss function
         self.criterion, self.val_loss = self._create_loss_function()
@@ -77,8 +86,7 @@ class Trainer:
             num_classes=self.config.data.num_classes,
             include_background=False,
             ignore_index=self.config.training.ignore_index,
-            compute_calibration=True,  # Enable for validation
-            num_bins=15
+            compute_calibration=False,
         )
         
         # Initialize data loaders
@@ -87,10 +95,13 @@ class Trainer:
         # Initialize tracking variables
         self.epoch = 0
         self.best_metric = 0.0
-        self.early_stopping = EarlyStopping(
-            patience=self.config.training.patience,
-            mode=self.config.training.monitor_mode
-        )
+        if not self.train_on_all:
+            self.early_stopping = EarlyStopping(
+                patience=self.config.training.patience,
+                mode=self.config.training.monitor_mode
+            )
+        else:
+            self.early_stopping = None
 
         # Track metrics history for debugging
         self.metrics_history = {
@@ -105,6 +116,10 @@ class Trainer:
         if checkpoint is not None:
             self._load_checkpoint(checkpoint)
         
+        # Step 4: Create scheduler after checkpoint loading (for warm restart support)
+        if self.scheduler is None:
+            self.scheduler = self._create_scheduler()
+        
         # Initialize wandb (with resume if we have a run_id) and create output directory
         if wandb.run is None and not (hasattr(self.config, 'run_id') and self.config.run_id == "offline_run"):
             self._init_wandb() 
@@ -117,7 +132,10 @@ class Trainer:
         elif wandb.run is None and hasattr(self.config, 'run_id') and self.config.run_id == "offline_run":
             self.run_id = "offline_run"
 
-        self.output_dir = Path(config.output_dir) / f"fold_{fold}_{self.run_id}"
+        # Set output directory if not already set (it's set earlier when resuming from checkpoint)
+        if not hasattr(self, 'output_dir'):
+            fold_label = "all" if self.train_on_all else str(fold)
+            self.output_dir = Path(config.output_dir) / f"fold_{fold_label}_{self.run_id}"
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         # Initialize visualization
@@ -130,8 +148,6 @@ class Trainer:
             print(f"Visualization enabled - saving to {viz_dir}")
         else:
             self.visualizer = None
-        
-        self.validation_table = wandb.Table(columns=["Epoch", "Sample_ID", "Loss", "Dice", "Image"], log_mode="INCREMENTAL")
     
     def _load_checkpoint_from_disk(self) -> Optional[Dict[str, Any]]:
         """
@@ -147,6 +163,57 @@ class Trainer:
         print(f"\nLoading checkpoint from {checkpoint_path}...")
         checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
         return checkpoint
+    
+    def _load_model_weights_only(self, checkpoint_path: str):
+        """
+        Load only model weights from a checkpoint file for initialization.
+        This starts a completely new training run with pretrained weights.
+        
+        Args:
+            checkpoint_path: Path to the checkpoint file to load weights from
+        """
+        checkpoint_path = Path(checkpoint_path)
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Init checkpoint not found: {checkpoint_path}")
+        
+        print(f"\n{'='*80}")
+        print("INITIALIZING MODEL FROM CHECKPOINT (new training run)")
+        print(f"{'='*80}")
+        print(f"  Loading weights from: {checkpoint_path}")
+        
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+        
+        if 'model_state_dict' not in checkpoint:
+            raise ValueError(f"No model_state_dict found in checkpoint: {checkpoint_path}")
+        
+        # Load model weights
+        model_state = checkpoint['model_state_dict']
+        
+        # Try to load with strict=True first, fall back to strict=False if architecture differs
+        try:
+            self.model.load_state_dict(model_state, strict=True)
+            print("  Model weights loaded successfully (strict mode)")
+        except RuntimeError as e:
+            print(f"  Warning: Strict loading failed, trying non-strict: {e}")
+            missing, unexpected = self.model.load_state_dict(model_state, strict=False)
+            if missing:
+                print(f"  Missing keys: {missing[:5]}{'...' if len(missing) > 5 else ''}")
+            if unexpected:
+                print(f"  Unexpected keys: {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
+        
+        # Log checkpoint info if available
+        if 'epoch' in checkpoint:
+            print(f"  Source checkpoint was at epoch: {checkpoint['epoch']}")
+        if 'best_metric' in checkpoint:
+            print(f"  Source checkpoint best metric: {checkpoint['best_metric']:.4f}")
+        if 'config' in checkpoint:
+            src_config = checkpoint['config']
+            if hasattr(src_config, 'model'):
+                print(f"  Source model: {src_config.model.architecture} ({src_config.model.model_size})")
+        
+        print(f"\n  Starting NEW training run with initialized weights")
+        print(f"  Epoch: 0, Best metric: 0.0, Fresh optimizer/scheduler")
+        print(f"{'='*80}\n")
     
     def _load_config(self, config, checkpoint: Optional[Dict[str, Any]]):
         """
@@ -164,16 +231,17 @@ class Trainer:
             print("\nStarting new training - using config from config.py")
             return config
         
-        # If resuming and flag is set, load config from checkpoint
+        # Load config from checkpoint
+        if 'config' not in checkpoint:
+            raise ValueError(f"No config found in checkpoint")
+        
+        loaded_config = checkpoint['config']
+        
+        # If resuming without use_new_config flag, use checkpoint config entirely
         if not hasattr(config, '_use_new_config') or not config._use_new_config:
             print(f"\n{'='*80}")
-            print(f"Loading configuration from checkpoint")
+            print(f"Loading configuration from checkpoint (NORMAL RESUME)")
             print(f"{'='*80}\n")
-            
-            if 'config' not in checkpoint:
-                raise ValueError(f"No config found in checkpoint")
-            
-            loaded_config = checkpoint['config']
             
             print("Configuration loaded successfully from checkpoint!")
             print(f"  Model: {loaded_config.model.architecture} ({loaded_config.model.model_size})")
@@ -185,9 +253,28 @@ class Trainer:
             
             return loaded_config
         else:
-            # Resuming but using new config from config.py
-            print("\nResuming training - using NEW config from config.py (checkpoint config ignored)")
-            return config
+            # Warm restart: use checkpoint config but override max_epochs from new config
+            print(f"\n{'='*80}")
+            print("WARM RESTART: Using checkpoint configuration with extended epochs")
+            print(f"{'='*80}")
+            print(f"Loading config from checkpoint...")
+            print(f"  Model: {loaded_config.model.architecture} ({loaded_config.model.model_size})")
+            print(f"  Batch size: {loaded_config.training.batch_size}")
+            print(f"  Learning rate: {loaded_config.training.initial_lr}")
+            print(f"  Original max epochs: {loaded_config.training.max_epochs}")
+            print(f"  Extended max epochs: {config.training.max_epochs}")
+            print(f"  W&B Project: {loaded_config.wandb.project}")
+            #print(f"  Loss function: {loaded_config.training.loss_function}")
+            print(f"  Patch size: {loaded_config.data.patch_size}")
+            
+            # Override warm restart-specific params from the new config
+            loaded_config.training.max_epochs = config.training.max_epochs
+            loaded_config.training.warm_restart_lr_factor = config.training.warm_restart_lr_factor
+
+            print(f"  Warm restart LR factor: {loaded_config.training.warm_restart_lr_factor}")
+            print(f"\nUsing checkpoint config with max_epochs updated to {loaded_config.training.max_epochs}")
+            print(f"{'='*80}\n")
+            return loaded_config
         
     def _find_latest_checkpoint(self) -> Optional[Path]:
         """Find the most recent checkpoint in the fold directory"""
@@ -200,32 +287,91 @@ class Trainer:
     
     def _load_checkpoint(self, checkpoint):
         """Load checkpoint and resume training"""
-        
+
+        # Load model, optimizer state, and scaler (scheduler handled separately below)
         checkpoint = load_checkpoint(
             checkpoint,
             self.model,
             self.optimizer,
-            self.scheduler,
+            None,  # Scheduler loaded below after creation
             self.scaler
         )
-        
+
         # Restore training state
-        self.epoch = checkpoint.get('epoch', 0) + 1  # Continue from next epoch
+        original_epoch = checkpoint.get('epoch', 0)
+        self.epoch = original_epoch + 1  # Continue from next epoch
         self.best_metric = checkpoint.get('best_metric', 0.0)
-        
+
         # Restore metrics history if available
         if 'metrics_history' in checkpoint:
             self.metrics_history = checkpoint['metrics_history']
+
+        # For normal resume (not warm restart), create scheduler and restore its state
+        if not self.warm_restart and 'scheduler_state_dict' in checkpoint:
+            self.scheduler = self._create_scheduler()
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            print(f"  Scheduler state restored (last_epoch={checkpoint['scheduler_state_dict'].get('last_epoch', '?')})")
         
-        print(f"Checkpoint loaded successfully!")
-        print(f"  Resuming from epoch: {self.epoch}")
-        print(f"  Best metric so far: {self.best_metric:.4f}")
-        print(f"  Current LR: {self.optimizer.param_groups[0]['lr']:.6f}")
+        # Apply warm restart if requested
+        if self.warm_restart:
+            remaining_epochs = self.config.training.max_epochs - self.epoch
+            print(f"\n{'='*80}")
+            print("WARM RESTART MODE ENABLED")
+            print(f"{'='*80}")
+            print(f"  Original training completed {original_epoch + 1} epochs (epoch 0-{original_epoch})")
+            print(f"  Will continue from epoch {self.epoch} to epoch {self.config.training.max_epochs - 1}")
+            print(f"  Remaining epochs: {remaining_epochs}")
+            
+            # Adjust learning rate with warm restart factor
+            original_lr = self.config.training.initial_lr
+            new_lr = original_lr * self.config.training.warm_restart_lr_factor
+            
+            print(f"  Original initial LR: {original_lr:.6f}")
+            print(f"  New initial LR (warm restart): {new_lr:.6f}")
+            print(f"  Warm restart factor: {self.config.training.warm_restart_lr_factor}")
+            
+            # Update optimizer learning rate
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = new_lr
+            
+            print(f"{'='*80}\n")
+        else:
+            print(f"Checkpoint loaded successfully!")
+            print(f"  Resuming from epoch: {self.epoch}")
+            print(f"  Best metric so far: {self.best_metric:.4f}")
+            print(f"  Current LR: {self.optimizer.param_groups[0]['lr']:.6f}")
         
         # Check if fold matches
         checkpoint_fold = checkpoint.get('fold', self.fold)
         if checkpoint_fold != self.fold:
             raise ValueError(f"Checkpoint is from fold {checkpoint_fold}, but training fold {self.fold}")
+    
+    def _convert_valid_bounds(self, valid_bounds_tensor: torch.Tensor):
+        """Convert valid_bounds tensor from batch to list of tuples for loss function.
+        
+        Args:
+            valid_bounds_tensor: (B, 6) tensor where each row is [w_min, w_max, h_min, h_max, d_min, d_max]
+                                or [-1, -1, -1, -1, -1, -1] if all voxels are valid
+        
+        Returns:
+            List of tuples ((w_min, w_max), (h_min, h_max), (d_min, d_max)) or None for each sample,
+            where None indicates all voxels are valid.
+        """
+        if valid_bounds_tensor is None:
+            return None
+        
+        result = []
+        for i in range(valid_bounds_tensor.shape[0]):
+            bounds = valid_bounds_tensor[i]
+            if bounds[0] == -1:  # Sentinel value for "all valid"
+                result.append(None)
+            else:
+                result.append((
+                    (int(bounds[0]), int(bounds[1])),
+                    (int(bounds[2]), int(bounds[3])),
+                    (int(bounds[4]), int(bounds[5]))
+                ))
+        return result
     
     def set_random_seeds(self, seed: int):
         """Set random seeds for reproducibility"""
@@ -274,10 +420,24 @@ class Trainer:
     def _create_scheduler(self):
         """Create learning rate scheduler"""
         if self.config.training.lr_scheduler == 'poly':
-            # Create scheduler with full max_epochs
+            # Calculate remaining iterations for scheduler
+            # For warm restart: calculate remaining epochs from current position
+            # For normal training: use full max_epochs
+            if self.warm_restart:
+                # Remaining epochs from current epoch to max_epochs
+                total_iters = self.config.training.max_epochs - self.epoch
+                print(f"  Creating PolynomialLR scheduler for warm restart:")
+                print(f"    Current epoch: {self.epoch}")
+                print(f"    Max epochs: {self.config.training.max_epochs}")
+                print(f"    Remaining iterations: {total_iters}")
+            else:
+                # Calculate remaining iterations if resuming
+                total_iters = self.config.training.max_epochs
+                print(f"  Creating PolynomialLR scheduler: total_iters={total_iters}")
+            
             scheduler = PolynomialLR(
                 self.optimizer,
-                total_iters=self.config.training.max_epochs,
+                total_iters=total_iters,
                 power=self.config.training.poly_lr_pow
             )
         else:
@@ -305,7 +465,6 @@ class Trainer:
         # Initialize data manager
         data_manager = DataManager(
             data_path=self.config.data.data_path,
-            brats_only=self.config.data.brats_only,
             max_samples=self.config.data.max_samples
         )
         
@@ -320,7 +479,8 @@ class Trainer:
             config=self.config,
             transforms_train=train_transforms,
             transforms_val=val_transforms,
-            use_preprocessed=self.config.data.use_preprocessed  # Use preprocessed numpy arrays
+            use_preprocessed=self.config.data.use_preprocessed,  # Use preprocessed numpy arrays
+            train_on_all=self.train_on_all
         )
         
         return train_loader, val_loader
@@ -330,21 +490,34 @@ class Trainer:
         # Determine if we're resuming a run
         resume_mode = "must" if self.run_id is not None else None
         
+        # Always pass the full actual config being used to wandb
+        # This ensures wandb displays what's actually running and helps detect errors
+        # For resume: config comes from checkpoint
+        # For warm restart: config comes from checkpoint with max_epochs updated
+        # For new run: config comes from config.py
+        fold_label = "all" if self.train_on_all else str(self.fold)
+        wandb_config = {
+            'fold': self.fold,
+            'train_on_all': self.train_on_all,
+            'model': self.config.model.__dict__,
+            'training': self.config.training.__dict__,
+            'data': self.config.data.__dict__,
+            'augmentation': self.config.augmentation.__dict__
+        }
+
+        tags = self.config.wandb.tags + [f"fold_{fold_label}"]
+        if self.train_on_all:
+            tags.append("train_on_all")
+
         wandb.init(
             project=self.config.wandb.project,
             entity=self.config.wandb.entity,
-            name=f"fold_{self.fold}",
-            tags=self.config.wandb.tags + [f"fold_{self.fold}"],
+            name=f"fold_{fold_label}",
+            tags=tags,
             notes=self.config.wandb.notes,
             id=self.run_id,  # Use existing run ID if resuming
             resume=resume_mode,  # Resume the run if ID is provided
-            config={
-                'fold': self.fold,
-                'model': self.config.model.__dict__,
-                'training': self.config.training.__dict__,
-                'data': self.config.data.__dict__,
-                'augmentation': self.config.augmentation.__dict__
-            }
+            config=wandb_config
         )
         
         # Store the run ID for checkpointing (important for new runs)
@@ -352,12 +525,13 @@ class Trainer:
             self.run_id = wandb.run.id
             print(f"Created new wandb run with ID: {self.run_id}")
         else:
-            print(f"Resumed wandb run with ID: {self.run_id}")
+            mode = "warm restart" if self.warm_restart else "normal resume"
+            print(f"Resumed wandb run with ID: {self.run_id} ({mode})")
+            print(f"Wandb config updated to reflect actual running configuration")
     
     def train_epoch(self) -> Dict[str, float]:
         """Train for one epoch (nnUNet style: fixed 250 iterations)"""
         self.model.train()
-        #self.train_metrics.reset()
         
         # Tracking variables
         loss_meter = AverageMeter()
@@ -366,24 +540,33 @@ class Trainer:
         if self.visualizer is not None:
             self.visualizer.reset_count()
         
+        self.train_loader.dataset.set_epoch(self.epoch)
+        
         # Create progress bar for this epoch
         pbar = tqdm(
-            self.train_loader,
+            range(self.config.training.num_iterations_per_epoch),
             desc=f"Epoch {self.epoch}/{self.config.training.max_epochs}",
             ncols=100,
-            leave=True
+            leave=True,
+            smoothing=1
         )
-        
-        # Fixed number of iterations per epoch (nnUNet approach)
-        for batch_idx, batch in enumerate(pbar):
-            # Track iteration time
-            iter_start_time = time.time()
-            
-            # Get next batch
-            images, targets = batch['image'], batch['label']
+        # Track iteration time
+        iter_start_time = time.time()
+        self.train_loader_iter = iter(self.train_loader)
 
-            # print mean and standard deviation of images for debugging
-            #print(f"Image stats - mean: {images.mean().item():.4f}, std: {images.std().item():.4f}")
+        # Fixed number of iterations per epoch (nnUNet approach)
+        for batch_idx in pbar:
+            try:
+                batch = next(self.train_loader_iter)
+            except StopIteration:
+                new_iter_start_time = time.time()
+                self.train_loader_iter = iter(self.train_loader)
+                batch = next(self.train_loader_iter)
+                print(f"\nReinitialized train loader iterator in {time.time() - new_iter_start_time:.2f} seconds")
+            
+            images, targets = batch['image'], batch['label']
+            valid_bounds = batch.get('valid_bounds', None)
+            weight_map = batch.get('weight_map', None)
                 
             if targets.dim() == 5 and targets.size(1) == 1:
                 targets = targets.squeeze(1)
@@ -393,6 +576,13 @@ class Trainer:
             # Move to device (normalization now happens in dataset)
             images = images.to(self.device, non_blocking=True)
             targets = targets.to(self.device, non_blocking=True)
+            if weight_map is not None:
+                weight_map = weight_map.to(self.device, non_blocking=True)
+            
+            # Convert valid_bounds tensor to list of tuples for loss function
+            valid_bounds_list = None
+            if valid_bounds is not None:
+                valid_bounds_list = self._convert_valid_bounds(valid_bounds)
 
             # Zero gradients
             self.optimizer.zero_grad()
@@ -402,11 +592,11 @@ class Trainer:
                 outputs = self.model(images)
                 
                 if self.config.model.deep_supervision and isinstance(outputs, list):
-                    loss = self.criterion(outputs, targets)
+                    loss, loss_components = self.criterion(outputs, targets, valid_bounds=valid_bounds_list, weight_map=weight_map)
                     # Use main output for metrics (highest resolution)
                     main_output = outputs[0]
                 else:
-                    loss = self.criterion(outputs, targets)
+                    loss, loss_components = self.criterion(outputs, targets, valid_bounds=valid_bounds_list, weight_map=weight_map)
                     main_output = outputs
             
             # Backward pass with gradient clipping
@@ -424,10 +614,11 @@ class Trainer:
             # Get current loss value
             current_loss = loss.item()
             
+            # Extract loss component values before deletion (for wandb logging)
+            loss_component_values = {k: v.item() if torch.is_tensor(v) else v for k, v in loss_components.items()}
+            
             # Update metrics
             loss_meter.update(current_loss, images.size(0))
-            #self.train_metrics.update(main_output, targets)
-
             # Visualize every 50 batches if enabled (not at the very beginning)
             if self.visualizer is not None and batch_idx > 0 and batch_idx % 50 == 0:
                 self.visualizer.visualize_batch(
@@ -437,12 +628,13 @@ class Trainer:
                 )
             
             # CRITICAL: Clear references to prevent memory leak
-            del images, targets, outputs, loss
-            if hasattr(self, 'main_output'):
-                del main_output
+            del images, targets, outputs, loss, loss_components, main_output
             
             # Calculate iteration time
             iter_time = time.time() - iter_start_time
+            
+            # Reset iteration timer
+            iter_start_time = time.time()
             
             # Get current learning rate
             current_lr = self.optimizer.param_groups[0]['lr']
@@ -455,19 +647,23 @@ class Trainer:
             })
             
             # Log to wandb every iteration
-            global_step = self.epoch * self.config.training.num_iterations_per_epoch + batch_idx
-            wandb.log({
-                'train/loss_iter': current_loss,
-                'train/learning_rate': current_lr,
-                'train/iter_time': iter_time,
-                'train/iteration': global_step
-            }, step=global_step)
+            if wandb.run is not None:
+                global_step = self.epoch * self.config.training.num_iterations_per_epoch + batch_idx
+                log_dict = {
+                    'train/loss_iter': current_loss,
+                    'train/learning_rate': current_lr,
+                    'train/iter_time': iter_time,
+                    'train/iteration': global_step
+                }
+                # Add loss components to log dict
+                for component_name, component_value in loss_component_values.items():
+                    log_dict[f'train/loss_{component_name}'] = component_value
+                wandb.log(log_dict, step=global_step)
         
         # Close progress bar
         pbar.close()
         
         # Compute epoch metrics
-        #train_metrics = self.train_metrics.compute()
         train_metrics = {}
 
         return train_metrics
@@ -514,7 +710,7 @@ class Trainer:
                 else:
                     main_output = outputs
 
-                loss = self.val_loss(main_output, targets)
+                loss, _ = self.val_loss(main_output, targets)
                 
                 # Update metrics
                 loss_meter.update(loss.item(), images.size(0))
@@ -528,7 +724,7 @@ class Trainer:
                     batch_probs = torch.softmax(main_output, dim=1)
                     
                     for i in range(images.shape[0]):
-                        img_slice, target_slice, pred_slice, _ = extract_slice_with_lesion(
+                        img_slice, target_slice, pred_slice, _ = extract_slice_with_foreground(
                             images[i],
                             targets[i],
                             batch_probs[i]
@@ -561,66 +757,55 @@ class Trainer:
         # Close progress bar
         pbar.close()
 
-        # Add samples to the persistent validation table
-        self._add_samples_to_table(random_samples)
+        # Create validation images
+        val_images = self._create_validation_images(random_samples)
         
         # Compute epoch metrics - dice, loss, and calibration metrics
         full_metrics = self.val_metrics.compute()
-        val_metrics = {
-            'loss': loss_meter.avg,
-            'dice_mean': full_metrics.get('dice_mean', 0.0),
-            'dice_hard': full_metrics.get('dice_hard', 0.0),
-            'samples': self.validation_table
-        }
-        
-        # Add calibration metrics if available
-        if 'ece' in full_metrics:
-            val_metrics['ece'] = full_metrics['ece']
-            val_metrics['mce'] = full_metrics['mce']
-            val_metrics['nll'] = full_metrics['nll']
-            val_metrics['brier_score'] = full_metrics['brier_score']
+
+        # Add loss and samples to metrics for logging
+        full_metrics['loss'] = loss_meter.avg
+        full_metrics['samples'] = val_images
 
         # Clean up to free memory
         del random_samples
         
-        return val_metrics
+        return full_metrics
     
-    def _add_samples_to_table(self, samples: list):
-        """Add validation samples to the persistent wandb table"""
+    def _create_validation_images(self, samples: list) -> List[wandb.Image]:
+        """Create wandb images for validation samples"""
         
         # Define class labels for wandb masks
         class_labels = {
             0: "background",
-            1: "metastasis"
+            1: "foreground"
         }
         
+        images_list = []
         # Log all samples from the random batch
         for i, sample in enumerate(samples):
-            sample_id = f"batch_{sample['batch_idx']}_sample_{sample.get('sample_idx', i)}"
-            
             # Create wandb Image with masks
             mask_img = wandb.Image(
                 sample['img_slice'],
                 masks={
                     "ground_truth": {"mask_data": sample['target_slice'], "class_labels": class_labels},
                     "prediction": {"mask_data": sample['pred_slice'], "class_labels": class_labels}
-                }
+                },
+                caption=f"Sample {sample.get('sample_idx', i)} - Loss: {sample['loss']:.4f}, Dice: {sample['dice']:.4f}"
             )
+            images_list.append(mask_img)
             
-            # Add row with epoch column
-            self.validation_table.add_data(
-                self.epoch,
-                sample_id,
-                f"{sample['loss']:.4f}",
-                f"{sample['dice']:.4f}",
-                mask_img
-            )
+        return images_list
     
     def train(self):
         """Main training loop"""
-        print(f"Starting training for fold {self.fold}")
+        fold_label = "all" if self.train_on_all else str(self.fold)
+        print(f"Starting training for fold {fold_label}")
         print(f"Training samples: {len(self.train_loader.dataset)}")
-        print(f"Validation samples: {len(self.val_loader.dataset)}")
+        if self.val_loader is not None:
+            print(f"Validation samples: {len(self.val_loader.dataset)}")
+        else:
+            print("Validation: DISABLED (train_on_all mode)")
 
         for epoch in range(self.epoch, self.config.training.max_epochs):
             self.epoch = epoch
@@ -637,10 +822,9 @@ class Trainer:
             if self.scheduler is not None:
                 self.scheduler.step()
             
-            # Validate
+            # Validate (skip when train_on_all)
             val_metrics = {}
-            if epoch % self.config.training.val_check_interval == 0:
-                # Validate
+            if not self.train_on_all and (epoch + 1) % self.config.training.val_check_interval == 0:
                 val_metrics = self.validate_epoch()
 
                 # Record validation metrics
@@ -651,6 +835,9 @@ class Trainer:
                 is_best = current_metric > self.best_metric
                 if is_best:
                     self.best_metric = current_metric
+            elif self.train_on_all:
+                # No validation; mark is_best periodically for checkpoint saving
+                is_best = (epoch + 1) % self.config.training.val_check_interval == 0
             
             epoch_time = time.time() - epoch_start_time
 
@@ -660,12 +847,8 @@ class Trainer:
                 'train/learning_rate': lr,
                 'train/epoch_time': epoch_time,
                 **{f'train/{k}': v for k, v in train_metrics.items()},
-                **{f'val/{k}': v for k, v in val_metrics.items() if k != 'samples'}
+                **{f'val/{k}': v for k, v in val_metrics.items()}
             }
-            
-            # Add table to the same log call if validation happened
-            if 'samples' in val_metrics:
-                log_dict['val/samples'] = self.validation_table
             
             wandb.log(log_dict)
             
@@ -689,7 +872,7 @@ class Trainer:
                     print(f"    MCE: {val_metrics['mce']:.4f}")
                     print(f"    NLL: {val_metrics['nll']:.4f}")
                     print(f"    Brier Score: {val_metrics['brier_score']:.4f}")
-                
+
                 if is_best:
                     print(f"  ★ New Best Dice: {self.best_metric:.4f} ★")
             print(f"{'='*80}\n")
@@ -712,13 +895,16 @@ class Trainer:
             )
             
             # Early stopping (only check when validation was performed)
-            if len(val_metrics.keys()) > 0:
+            if not self.train_on_all and len(val_metrics.keys()) > 0:
                 if self.early_stopping(current_metric):
                     print(f"Early stopping triggered at epoch {epoch}")
                     break
-        
-        print(f"Training completed for fold {self.fold}")
-        print(f"Best validation Dice: {self.best_metric:.4f}")
+
+        print(f"Training completed for fold {fold_label}")
+        if not self.train_on_all:
+            print(f"Best validation Dice: {self.best_metric:.4f}")
+        else:
+            print(f"Completed {self.config.training.max_epochs} epochs (train_on_all, no validation)")
         
         # Create summary plot if visualization enabled
         if self.visualizer is not None:
@@ -728,13 +914,13 @@ class Trainer:
         return self.best_metric
 
 
-def run_single_fold(fold: int, config, enable_visualization: bool = False, resume_id: Optional[str] = None):
+def run_single_fold(fold: int, config, enable_visualization: bool = False, resume_id: Optional[str] = None, warm_restart: bool = False, init_checkpoint: Optional[str] = None):
     """Run training for a single fold"""
     print(f"\n{'='*50}")
     print(f"Starting fold {fold}")
     print(f"{'='*50}")
     
-    trainer = Trainer(config, fold, enable_visualization=enable_visualization, resume_id=resume_id)
+    trainer = Trainer(config, fold, enable_visualization=enable_visualization, resume_id=resume_id, warm_restart=warm_restart, init_checkpoint=init_checkpoint)
     best_metric = trainer.train()
     
     wandb.finish()
@@ -742,12 +928,12 @@ def run_single_fold(fold: int, config, enable_visualization: bool = False, resum
     return best_metric
 
 
-def run_cross_validation(config, enable_visualization: bool = False, resume_id: Optional[str] = None):
+def run_cross_validation(config, enable_visualization: bool = False, resume_id: Optional[str] = None, warm_restart: bool = False, init_checkpoint: Optional[str] = None):
     """Run full 5-fold cross validation"""
     fold_results = []
     
     for fold in range(config.data.num_folds):
-        best_metric = run_single_fold(fold, config, enable_visualization=enable_visualization, resume_id=resume_id)
+        best_metric = run_single_fold(fold, config, enable_visualization=enable_visualization, resume_id=resume_id, warm_restart=warm_restart, init_checkpoint=init_checkpoint)
         fold_results.append(best_metric)
         
         print(f"Fold {fold} completed with best Dice: {best_metric:.4f}")

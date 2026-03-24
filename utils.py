@@ -332,76 +332,8 @@ class ProgressTracker:
         with open(save_path, 'wb') as f:
             pickle.dump(data, f)
 
-
-def create_validation_samples_table(random_batches: list, worst_batch: dict, wandb):
-    """Create wandb table with random batches and worst batch samples"""
-
-    # Define class labels for wandb masks
-    class_labels = {
-        0: "background",
-        1: "metastasis"
-    }
-    
-    # Create wandb table with Sample_ID, Loss, and Image (with masks)
-    table = wandb.Table(columns=["Sample_ID", "Loss", "Image"])
-    
-    # Log all samples from worst batch
-    batch_size = worst_batch['images'].shape[0]
-    for sample_idx in range(batch_size):
-        sample_id = f"worst_batch_sample_{sample_idx}"
-
-        img_slice, target_slice, pred_slice, z_idx = extract_slice_with_lesion(
-            worst_batch['images'][sample_idx],
-            worst_batch['targets'][sample_idx],
-            worst_batch['predictions'][sample_idx]
-        )
-        
-        # Create wandb Image with masks
-        mask_img = wandb.Image(
-            img_slice,
-            masks={
-                "ground_truth": {"mask_data": target_slice, "class_labels": class_labels},
-                "prediction": {"mask_data": pred_slice, "class_labels": class_labels}
-            }
-        )
-        
-        table.add_data(
-            sample_id,
-            f"{worst_batch['loss']:.4f}",
-            mask_img
-        )
-    
-    # Log one random sample from each of 5 random batches
-    for batch_idx, batch in enumerate(random_batches):
-        # Pick first sample from batch
-        sample_idx = 0
-        sample_id = f"random_batch_{batch_idx}_sample_{sample_idx}"
-        img_slice, target_slice, pred_slice, z_idx = extract_slice_with_lesion(
-            batch['images'][sample_idx],
-            batch['targets'][sample_idx],
-            batch['predictions'][sample_idx]
-        )
-        
-        # Create wandb Image with masks
-        mask_img = wandb.Image(
-            img_slice,
-            masks={
-                "ground_truth": {"mask_data": target_slice, "class_labels": class_labels},
-                "prediction": {"mask_data": pred_slice, "class_labels": class_labels}
-            }
-        )
-        
-        table.add_data(
-            sample_id,
-            f"{batch['loss']:.4f}",
-            mask_img
-        )
-    
-    return table
-
-
-def extract_slice_with_lesion(image, target, pred_class):
-    """Extract slice with most lesion pixels and return numpy arrays"""
+def extract_slice_with_foreground(image, target, pred_class, debug_dir='./debug_slices', sample_id=None):
+    """Extract slice with most foreground pixels and return numpy arrays"""
     # image: (C, H, W, D) or (H, W, D)
     # target: (H, W, D)
     # prediction: (C, H, W, D)
@@ -414,7 +346,7 @@ def extract_slice_with_lesion(image, target, pred_class):
     
     # Convert to numpy
     target_np = target.cpu().numpy() if torch.is_tensor(target) else target
-    
+
     # Find slice with lesion (max lesion area in target)
     # Only consider slices with actual lesions (value 1), ignore -1 and 0
     target_lesion_mask = (target_np == 1).astype(np.float32)
@@ -436,7 +368,7 @@ def extract_slice_with_lesion(image, target, pred_class):
     pred_slice = (pred_prob_slice > 0.5).astype(np.uint8)
     
     # Replace -1 (ignore index) with 0 (background) for visualization
-    target_slice = np.where(target_slice == -1, 0, target_slice).astype(np.uint8)
+    target_slice_viz = np.where(target_slice == -1, 0, target_slice).astype(np.uint8)
     
     # Normalize image to 0-255 range for wandb (assuming it's normalized/standardized)
     img_slice = img_slice.astype(np.float32)
@@ -445,4 +377,5 @@ def extract_slice_with_lesion(image, target, pred_class):
     # Scale to 0-255
     img_slice = ((img_slice + 3) / 6.0 * 255).astype(np.uint8)
     
-    return img_slice, target_slice, pred_slice, z_idx
+    # Return masks as class indices (0, 1) for wandb compatibility
+    return img_slice, target_slice_viz, pred_slice, z_idx

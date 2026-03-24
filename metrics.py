@@ -4,41 +4,39 @@ Metrics for segmentation evaluation
 import torch
 from typing import Dict, Tuple
 import torch.nn.functional as F
+from skimage.measure import euler_number
+import cc3d
+import numpy as np
+import time
+from concurrent.futures import ProcessPoolExecutor
+import os
 
 
 def prepare_targets_with_mask(
     targets: torch.Tensor,
     num_classes: int,
-    ignore_index: int = -1,
-    additional_mask: torch.Tensor = None
+    ignore_index: int = -1
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Centralized utility to prepare targets and create valid mask.
     
     This function handles the common pattern of:
     1. Creating a mask for valid voxels (excluding ignore_index)
-    2. Optionally intersecting with an additional mask (e.g., foreground union)
-    3. Clamping targets to valid range [0, num_classes)
+    2. Clamping targets to valid range [0, num_classes)
     
     Args:
         targets: (B, H, W, D) - class indices
         num_classes: Number of classes
         ignore_index: Index to ignore in target
-        additional_mask: Optional (B, H, W, D) boolean mask to further restrict valid voxels
-                        (e.g., foreground union mask for calibration on foreground only)
     
     Returns:
         Tuple of (valid_mask, targets_clamped, num_valid_voxels):
-        - valid_mask: (B, H, W, D) - boolean mask where targets != ignore_index (and additional_mask if provided)
+        - valid_mask: (B, H, W, D) - boolean mask where targets != ignore_index
         - targets_clamped: (B, H, W, D) - targets clamped to [0, num_classes)
         - num_valid_voxels: scalar - total number of valid voxels
     """
     # Create mask for valid voxels (not ignore_index)
     valid_mask = targets != ignore_index
-    
-    # Intersect with additional mask if provided
-    if additional_mask is not None:
-        valid_mask = valid_mask & additional_mask
     
     # Clamp targets to valid range [0, num_classes) for safety
     targets_clamped = torch.clamp(targets, 0, num_classes - 1)
@@ -125,7 +123,7 @@ def dice_coefficient(
 
 
 def hard_dice_coefficient(
-    predictions: torch.Tensor,
+    pred_indices: torch.Tensor,
     targets_clamped: torch.Tensor,
     valid_mask: torch.Tensor,
     include_background: bool = False,
@@ -136,7 +134,7 @@ def hard_dice_coefficient(
     Computes Hard Dice (using argmax) averaged over the batch.
     
     Args:
-        predictions: (B, C, H, W, D) - logits where C is num_classes
+        pred_indices: (B, H, W, D) - class indices from argmax of predictions
         targets_clamped: (B, H, W, D) - class indices clamped to [0, num_classes)
         valid_mask: (B, H, W, D) - boolean mask for valid voxels
         include_background: Whether to include background class in calculation
@@ -145,10 +143,7 @@ def hard_dice_coefficient(
     Returns:
         Dice coefficient per class (averaged over batch)
     """
-    num_classes = predictions.shape[1]
-    
-    # Get hard predictions (argmax)
-    pred_indices = torch.argmax(predictions, dim=1) # (B, H, W, D)
+    num_classes = targets_clamped.max().item() + 1
     
     # Convert to one-hot
     pred_one_hot = F.one_hot(pred_indices, num_classes=num_classes).permute(0, 4, 1, 2, 3).float()
@@ -178,72 +173,85 @@ def hard_dice_coefficient(
 
 
 class MetricsCalculator:
-    """Class to calculate and accumulate metrics during training/validation"""
-    
-    def __init__(self, num_classes: int = 2, include_background: bool = False, ignore_index: int = -1, compute_calibration: bool = True, num_bins: int = 15):
+    """Class to calculate and accumulate metrics during training/validation."""
+
+    def __init__(self, num_classes: int = 2, include_background: bool = False, ignore_index: int = -1, compute_calibration: bool = False, num_bins: int = 15):
         self.num_classes = num_classes
         self.include_background = include_background
         self.ignore_index = ignore_index
         self.compute_calibration = compute_calibration
         self.num_bins = num_bins
         self.reset()
-    
+
     def reset(self):
-        """Reset accumulated metrics"""
+        """Reset accumulated metrics (called at start of each validation epoch)"""
         self.dice_scores = []
         self.hard_dice_scores = []
         self.total_samples = 0
-        
+
         # Calibration metrics accumulators
         if self.compute_calibration:
             self.ece_scores = []
             self.mce_scores = []
             self.nll_scores = []
             self.brier_scores = []
-    
+
+        # Topological metrics accumulators
+        self.topo_metrics = []
+
     def update(self, predictions: torch.Tensor, targets: torch.Tensor) -> Dict[str, float]:
         """
-        Update metrics with new batch
-        
+        Update metrics with new batch.
+
         Args:
             predictions: (B, C, H, W, D) - logits
             targets: (B, H, W, D) - class indices
-            
+
         Returns:
             Dictionary of metrics for the current batch
         """
         batch_size = predictions.shape[0]
         self.total_samples += batch_size
         num_classes = predictions.shape[1]
-        
+
         # Perform masking once here (centralized)
         valid_mask, targets_clamped, num_valid_voxels = prepare_targets_with_mask(
             targets, num_classes, self.ignore_index
         )
-        
+
+        # calculate argmax predictions
+        argmax_preds = predictions.argmax(dim=1)
+
         # Calculate dice metric (pass mask info)
         dice = dice_coefficient(
             predictions, targets_clamped, valid_mask,
             include_background=self.include_background,
             smooth=1e-5
         )
-        
+
         # Accumulate dice scores
         self.dice_scores.append(dice)
-        
+
         # Calculate hard dice
         hard_dice = hard_dice_coefficient(
-            predictions, targets_clamped, valid_mask,
+            argmax_preds, targets_clamped, valid_mask,
             include_background=self.include_background,
             smooth=1e-5
         )
         self.hard_dice_scores.append(hard_dice)
-        
+
         batch_metrics = {
             'dice_mean': dice.mean().item(),
             'dice_hard': hard_dice.mean().item()
         }
-        
+
+        # Betti number metrics (cheap)
+        topological_errors = compute_topological_errors(
+            targets_clamped, argmax_preds, valid_mask
+        )
+        self.topo_metrics.append(topological_errors)
+        batch_metrics.update(topological_errors)
+
         # Calculate calibration metrics if enabled (pass mask info)
         if self.compute_calibration:
             cal_metrics = compute_calibration_metrics(
@@ -254,32 +262,37 @@ class MetricsCalculator:
             self.mce_scores.append(cal_metrics['mce'])
             self.nll_scores.append(cal_metrics['nll'])
             self.brier_scores.append(cal_metrics['brier_score'])
-            
+
             batch_metrics.update(cal_metrics)
-            
+
         return batch_metrics
-    
+
     def compute(self) -> Dict[str, float]:
-        """Compute final metrics"""
+        """Compute final epoch-level metrics."""
         if not self.dice_scores:
             return {}
-        
+
         # Stack and average dice
         dice_mean = torch.stack(self.dice_scores).mean(dim=0)
         hard_dice_mean = torch.stack(self.hard_dice_scores).mean(dim=0)
-        
+
         results = {
             'dice_mean': dice_mean.mean().item(),
             'dice_hard': hard_dice_mean.mean().item(),
         }
-        
+
         # Add calibration metrics if computed
         if self.compute_calibration and self.ece_scores:
             results['ece'] = sum(self.ece_scores) / len(self.ece_scores)
             results['mce'] = sum(self.mce_scores) / len(self.mce_scores)
             results['nll'] = sum(self.nll_scores) / len(self.nll_scores)
             results['brier_score'] = sum(self.brier_scores) / len(self.brier_scores)
-        
+
+        # Add topological metrics if computed
+        if self.topo_metrics and len(self.topo_metrics) > 0:
+            for key in self.topo_metrics[0].keys():
+                results[key] = sum(m[key] for m in self.topo_metrics) / len(self.topo_metrics)
+
         return results
     
     def get_main_metric(self) -> float:
@@ -289,6 +302,95 @@ class MetricsCalculator:
         
         dice_mean = torch.stack(self.dice_scores).mean(dim=0)
         return dice_mean.mean().item()
+
+def get_betti_numbers(image):
+    """Returns [b0, b1, b2] for a binary image using Euler method."""
+    padded_image = np.pad(image, 1, mode='constant', constant_values=0)
+    chi = int(euler_number(padded_image, connectivity=3)) # 26-connectivity
+    b0 = int(cc3d.connected_components(padded_image, connectivity=26, binary_image=True).max())
+    
+    # Invert for b2 (background components), using dual connectivity (6-conn)
+    b2 = int(cc3d.connected_components(1 - padded_image, connectivity=6, binary_image=True).max()) - 1
+    
+    b1 = b0 + b2 - chi
+    return np.array([b0, b1, b2], dtype=np.int64)
+
+def _compute_sample_topological_metrics(args):
+    """Helper function for parallel processing of single sample."""
+    gt_sample, pred_sample = args
+    
+    # Get Betti counts
+    b_gt = get_betti_numbers(gt_sample)
+    b_pred = get_betti_numbers(pred_sample)
+    
+    return {
+        "b0_pred": b_pred[0],
+        "b1_pred": b_pred[1],
+        "b2_pred": b_pred[2],
+        "b0_gt": b_gt[0],
+        "b1_gt": b_gt[1],
+        "b2_gt": b_gt[2],
+    }
+
+def compute_topological_errors(
+    gt: torch.Tensor, 
+    pred: torch.Tensor,
+    valid_mask: torch.Tensor,
+    use_parallel: bool = True,
+    num_workers: int = None
+):
+    """
+    Compute topological errors for a batch of 3D segmentations.
+    
+    Args:
+        gt: (B, H, W, D) - ground truth class indices
+        pred: (B, H, W, D) - predicted class indices
+        valid_mask: (B, H, W, D) - boolean mask for valid voxels
+        use_parallel: Whether to use parallel processing across batch
+        num_workers: Number of parallel workers (default: cpu_count)
+        
+    Returns:
+        Dictionary of topological metrics averaged over the batch
+    """
+    # binarize
+    gt_bin = (gt > 0)
+    pred_bin = (pred > 0)
+
+    # mask out invalid regions
+    gt_bin = torch.logical_and(gt_bin, valid_mask)
+    pred_bin = torch.logical_and(pred_bin, valid_mask)
+
+    # Convert to numpy
+    gt_bin = gt_bin.cpu().numpy()
+    pred_bin = pred_bin.cpu().numpy()
+    
+    batch_size = gt.shape[0]
+    
+    # Prepare arguments for each sample
+    sample_args = [
+        (gt_bin[b], pred_bin[b])
+        for b in range(batch_size)
+    ]
+    
+    # Compute metrics (parallel or sequential)
+    if use_parallel and batch_size > 1:
+        max_workers = num_workers if num_workers else min(batch_size, os.cpu_count())
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            metrics_list = list(executor.map(_compute_sample_topological_metrics, sample_args))
+    else:
+        metrics_list = [_compute_sample_topological_metrics(args) for args in sample_args]
+    
+    # Average metrics across batch
+    averaged_metrics = {}
+    if metrics_list:
+        for key in metrics_list[0].keys():
+            # Handle NaN values by counting them as 1
+            averaged_metrics[key] = sum(
+                1.0 if (isinstance(m[key], (float, np.floating)) and np.isnan(m[key])) else m[key] 
+                for m in metrics_list
+            ) / len(metrics_list)
+    
+    return averaged_metrics
 
 def compute_calibration_metrics(
     logits: torch.Tensor, 
@@ -354,7 +456,6 @@ def compute_calibration_metrics(
         for b in range(batch_size):
             # Get single sample tensors
             probs_b = probs[b]  # (C, H, W, D)
-            logits_b = logits[b]  # (C, H, W, D)
             targets_b = targets[b]  # (H, W, D)
             targets_clamped_b = targets_clamped[b]  # (H, W, D)
             valid_mask_b = valid_mask[b]  # (H, W, D)
@@ -362,13 +463,11 @@ def compute_calibration_metrics(
             # Flatten spatial dimensions for per-voxel metrics
             # (C, H, W, D) -> (H*W*D, C)
             probs_flat = probs_b.permute(1, 2, 3, 0).reshape(-1, num_classes)
-            logits_flat = logits_b.permute(1, 2, 3, 0).reshape(-1, num_classes)
             targets_flat = targets_clamped_b.reshape(-1)
             valid_mask_flat = valid_mask_b.reshape(-1)
             
             # Filter to only valid voxels
             probs_valid = probs_flat[valid_mask_flat]
-            logits_valid = logits_flat[valid_mask_flat]
             targets_valid = targets_flat[valid_mask_flat]
             num_valid = valid_mask_flat.sum()
             
@@ -389,7 +488,9 @@ def compute_calibration_metrics(
             mce_samples.append(mce.item())
 
             # 3. Negative Log-Likelihood (NLL) - per sample
-            nll = F.cross_entropy(logits_valid, targets_valid, reduction='mean', ignore_index=ignore_index)
+            logits_b = logits[b:b+1]  # Keep batch dim: (1, C, H, W, D)
+            targets_b_orig = targets[b:b+1]  # Keep batch dim: (1, H, W, D)
+            nll = F.cross_entropy(logits_b, targets_b_orig, reduction='mean', ignore_index=ignore_index)
             nll_samples.append(nll.item())
 
             # 4. Brier Score per sample
