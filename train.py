@@ -32,13 +32,13 @@ class Trainer:
     def __init__(self, config, fold: int, enable_visualization: bool = False, resume_id: Optional[str] = None, warm_restart: bool = False, init_checkpoint: Optional[str] = None):
         self.fold = fold
         self.enable_visualization = enable_visualization
-        self.run_id = resume_id
+        self.run_id = resume_id or getattr(config, 'run_id', None)
         self.warm_restart = warm_restart
         self.init_checkpoint = init_checkpoint
         self.train_on_all = getattr(config.data, 'train_on_all', False)
 
         # Determine output path if resuming (directory must exist for checkpoint loading)
-        if self.run_id is not None:
+        if resume_id is not None:
             fold_label = "all" if self.train_on_all else str(fold)
             self.output_dir = Path(config.output_dir) / f"fold_{fold_label}_{self.run_id}"
             if not self.output_dir.exists():
@@ -66,7 +66,15 @@ class Trainer:
         # Load model weights from init_checkpoint if provided (for transfer learning / initialization only)
         if self.init_checkpoint is not None:
             self._load_model_weights_only(self.init_checkpoint)
-        
+
+        # Apply finetuning modifications (freeze encoder, LoRA)
+        # Order: load pretrained weights → apply LoRA (decomposes MHA and copies weights) → freeze encoder → create optimizer
+        # For --resume: LoRA must be applied before _load_checkpoint so state dict keys match
+        if self.config.training.lora_enabled:
+            self._apply_lora()
+        if self.config.training.freeze_encoder:
+            self._apply_encoder_freezing()
+
         # Initialize optimizer and scheduler
         # Note: For warm restart, optimizer LR will be adjusted after checkpoint loading
         self.optimizer = self._create_optimizer()
@@ -87,6 +95,7 @@ class Trainer:
             include_background=False,
             ignore_index=self.config.training.ignore_index,
             compute_calibration=False,
+            compute_topological=False,
         )
         
         # Initialize data loaders
@@ -121,16 +130,12 @@ class Trainer:
             self.scheduler = self._create_scheduler()
         
         # Initialize wandb (with resume if we have a run_id) and create output directory
-        if wandb.run is None and not (hasattr(self.config, 'run_id') and self.config.run_id == "offline_run"):
-            self._init_wandb() 
-            # Set output directory after wandb init to include run_id
+        if wandb.run is None:
+            self._init_wandb()
         elif wandb.run is not None and self.run_id is None:
             # wandb was already initialized (e.g., by sweep agent)
-            # Get run_id from existing wandb run and set up output directory
             self.run_id = wandb.run.id
             print(f"Using existing wandb run with ID: {self.run_id}")
-        elif wandb.run is None and hasattr(self.config, 'run_id') and self.config.run_id == "offline_run":
-            self.run_id = "offline_run"
 
         # Set output directory if not already set (it's set earlier when resuming from checkpoint)
         if not hasattr(self, 'output_dir'):
@@ -214,7 +219,64 @@ class Trainer:
         print(f"\n  Starting NEW training run with initialized weights")
         print(f"  Epoch: 0, Best metric: 0.0, Fresh optimizer/scheduler")
         print(f"{'='*80}\n")
-    
+
+    def _get_encoder_module(self):
+        """Get the encoder submodule (works for both standard and text-prompted models)."""
+        if hasattr(self.model, 'encoder'):
+            return self.model.encoder
+        return None
+
+    def _apply_encoder_freezing(self):
+        """Freeze all encoder parameters so they are not updated during training."""
+        encoder = self._get_encoder_module()
+        if encoder is None:
+            print("WARNING: Could not identify encoder module — skipping freeze")
+            return
+
+        frozen_count = 0
+        for param in encoder.parameters():
+            param.requires_grad = False
+            frozen_count += param.numel()
+
+        total_params = sum(p.numel() for p in self.model.parameters())
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+
+        print(f"\n{'='*80}")
+        print("ENCODER FREEZING ENABLED")
+        print(f"  Frozen encoder parameters: {frozen_count:,}")
+        print(f"  Total model parameters: {total_params:,}")
+        print(f"  Trainable parameters: {trainable_params:,} ({100*trainable_params/total_params:.1f}%)")
+        print(f"{'='*80}\n")
+
+    def _apply_lora(self):
+        """Apply LoRA adapters to the transformer decoder attention layers."""
+        if not hasattr(self.model, 'transformer_decoder'):
+            print("WARNING: Model has no transformer_decoder — skipping LoRA")
+            return
+
+        from lora import apply_lora_to_transformer
+        frozen, lora_trainable = apply_lora_to_transformer(
+            self.model.transformer_decoder,
+            rank=self.config.training.lora_rank,
+            alpha=self.config.training.lora_alpha,
+            dropout=self.config.training.lora_dropout,
+        )
+
+        # Move new LoRA parameters to the same device as the model
+        self.model.transformer_decoder.to(self.device)
+
+        total_params = sum(p.numel() for p in self.model.parameters())
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+
+        print(f"\n{'='*80}")
+        print("LoRA ENABLED ON TRANSFORMER DECODER")
+        print(f"  Rank: {self.config.training.lora_rank}, Alpha: {self.config.training.lora_alpha}")
+        print(f"  Frozen transformer parameters: {frozen:,}")
+        print(f"  New LoRA parameters: {lora_trainable:,}")
+        print(f"  Total model parameters: {total_params:,}")
+        print(f"  Trainable parameters: {trainable_params:,} ({100*trainable_params/total_params:.1f}%)")
+        print(f"{'='*80}\n")
+
     def _load_config(self, config, checkpoint: Optional[Dict[str, Any]]):
         """
         Determine which config to use (from checkpoint or provided config).
@@ -323,23 +385,20 @@ class Trainer:
             print(f"  Remaining epochs: {remaining_epochs}")
             
             # Adjust learning rate with warm restart factor
-            original_lr = self.config.training.initial_lr
-            new_lr = original_lr * self.config.training.warm_restart_lr_factor
-            
-            print(f"  Original initial LR: {original_lr:.6f}")
-            print(f"  New initial LR (warm restart): {new_lr:.6f}")
-            print(f"  Warm restart factor: {self.config.training.warm_restart_lr_factor}")
-            
-            # Update optimizer learning rate
+            # Apply proportionally to each param group (preserves differential LR ratios)
+            factor = self.config.training.warm_restart_lr_factor
+            print(f"  Warm restart factor: {factor}")
             for param_group in self.optimizer.param_groups:
-                param_group['lr'] = new_lr
-            
+                old_lr = param_group['lr']
+                param_group['lr'] = old_lr * factor
+                print(f"  LR: {old_lr:.6f} → {param_group['lr']:.6f}")
+
             print(f"{'='*80}\n")
         else:
             print(f"Checkpoint loaded successfully!")
             print(f"  Resuming from epoch: {self.epoch}")
             print(f"  Best metric so far: {self.best_metric:.4f}")
-            print(f"  Current LR: {self.optimizer.param_groups[0]['lr']:.6f}")
+            print(f"  Current LR: {self.optimizer.param_groups[-1]['lr']:.6f}")
         
         # Check if fold matches
         checkpoint_fold = checkpoint.get('fold', self.fold)
@@ -407,14 +466,42 @@ class Trainer:
         return model
     
     def _create_optimizer(self) -> optim.Optimizer:
-        """Create optimizer"""
-        optimizer = optim.SGD(
-            self.model.parameters(),
-            lr=self.config.training.initial_lr,
+        """Create optimizer with optional parameter groups for differential LR."""
+        lr = self.config.training.initial_lr
+        common_kwargs = dict(
             momentum=self.config.training.momentum,
             weight_decay=self.config.training.weight_decay,
-            nesterov=True
+            nesterov=True,
         )
+
+        # Differential LR: separate param groups for encoder vs rest
+        use_param_groups = (
+            not self.config.training.freeze_encoder
+            and self.config.training.encoder_lr_factor != 1.0
+        )
+
+        if use_param_groups:
+            encoder = self._get_encoder_module()
+            if encoder is not None:
+                encoder_param_ids = set(id(p) for p in encoder.parameters())
+                encoder_params = [p for p in self.model.parameters() if p.requires_grad and id(p) in encoder_param_ids]
+                other_params = [p for p in self.model.parameters() if p.requires_grad and id(p) not in encoder_param_ids]
+
+                encoder_lr = lr * self.config.training.encoder_lr_factor
+                param_groups = [
+                    {'params': encoder_params, 'lr': encoder_lr},
+                    {'params': other_params, 'lr': lr},
+                ]
+
+                print(f"  Differential LR: encoder={encoder_lr:.6f}, rest={lr:.6f} "
+                      f"(factor={self.config.training.encoder_lr_factor})")
+
+                optimizer = optim.SGD(param_groups, **common_kwargs)
+                return optimizer
+
+        # Default: single param group with only trainable params
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        optimizer = optim.SGD(trainable_params, lr=lr, **common_kwargs)
         return optimizer
     
     def _create_scheduler(self):
@@ -472,6 +559,31 @@ class Trainer:
         train_transforms = get_training_transforms(self.config)
         val_transforms = get_validation_transforms(self.config)
         
+        # Load text-prompted data if enabled
+        precomputed_embeddings = None
+        prompts_data = None
+        if hasattr(self.config, 'text_prompted') and self.config.text_prompted.enabled:
+            tp = self.config.text_prompted
+            if tp.precomputed_embeddings_path:
+                print(f"Loading precomputed text embeddings from {tp.precomputed_embeddings_path}")
+                precomputed_embeddings = torch.load(
+                    tp.precomputed_embeddings_path, map_location='cpu', weights_only=True
+                )
+            if tp.prompts_json_path:
+                import json as _json
+                from pathlib import Path as _Path
+                prompts_path = _Path(tp.prompts_json_path)
+                if prompts_path.is_dir():
+                    print(f"Loading prompts from directory {prompts_path}")
+                    prompts_data = {}
+                    for jf in sorted(prompts_path.glob("*.json")):
+                        with open(jf) as f:
+                            prompts_data[jf.stem] = _json.load(f)
+                else:
+                    print(f"Loading prompts from {prompts_path}")
+                    with open(prompts_path, 'r') as f:
+                        prompts_data = _json.load(f)
+
         # Create data loaders with use_preprocessed flag
         train_loader, val_loader = create_data_loaders(
             data_manager=data_manager,
@@ -479,10 +591,12 @@ class Trainer:
             config=self.config,
             transforms_train=train_transforms,
             transforms_val=val_transforms,
-            use_preprocessed=self.config.data.use_preprocessed,  # Use preprocessed numpy arrays
-            train_on_all=self.train_on_all
+            use_preprocessed=self.config.data.use_preprocessed,
+            train_on_all=self.train_on_all,
+            precomputed_embeddings=precomputed_embeddings,
+            prompts_data=prompts_data,
         )
-        
+
         return train_loader, val_loader
     
     def _init_wandb(self):
@@ -567,17 +681,26 @@ class Trainer:
             images, targets = batch['image'], batch['label']
             valid_bounds = batch.get('valid_bounds', None)
             weight_map = batch.get('weight_map', None)
-                
-            if targets.dim() == 5 and targets.size(1) == 1:
-                targets = targets.squeeze(1)
+            text_embedding = batch.get('text_embedding', None)
+
+            # Standard mode: squeeze (B, 1, H, W, D) -> (B, H, W, D) for multi-class loss
+            # Binary mode (num_classes=1): keep (B, 1, H, W, D) for binary CombinedLoss
+            if self.config.data.num_classes == 1:
+                if targets.dim() == 4:
+                    targets = targets.unsqueeze(1)  # (B, H, W, D) -> (B, 1, H, W, D)
             else:
-                raise ValueError(f"Targets should have shape (B, 1, H, W, D), got {targets.shape}")
+                if targets.dim() == 5 and targets.size(1) == 1:
+                    targets = targets.squeeze(1)
+                elif targets.dim() != 4:
+                    raise ValueError(f"Targets should have shape (B, 1, H, W, D) or (B, H, W, D), got {targets.shape}")
 
             # Move to device (normalization now happens in dataset)
             images = images.to(self.device, non_blocking=True)
             targets = targets.to(self.device, non_blocking=True)
             if weight_map is not None:
                 weight_map = weight_map.to(self.device, non_blocking=True)
+            if text_embedding is not None:
+                text_embedding = text_embedding.to(self.device, non_blocking=True)
             
             # Convert valid_bounds tensor to list of tuples for loss function
             valid_bounds_list = None
@@ -589,7 +712,10 @@ class Trainer:
             
             # Forward pass with mixed precision
             with autocast(device_type='cuda', enabled=self.scaler is not None):
-                outputs = self.model(images)
+                if text_embedding is not None:
+                    outputs = self.model(images, text_embedding)
+                else:
+                    outputs = self.model(images)
                 
                 if self.config.model.deep_supervision and isinstance(outputs, list):
                     loss, loss_components = self.criterion(outputs, targets, valid_bounds=valid_bounds_list, weight_map=weight_map)
@@ -636,8 +762,8 @@ class Trainer:
             # Reset iteration timer
             iter_start_time = time.time()
             
-            # Get current learning rate
-            current_lr = self.optimizer.param_groups[0]['lr']
+            # Get current learning rate (use last group = primary/non-encoder LR)
+            current_lr = self.optimizer.param_groups[-1]['lr']
             
             # Update progress bar with current loss and iteration time
             pbar.set_postfix({
@@ -655,6 +781,9 @@ class Trainer:
                     'train/iter_time': iter_time,
                     'train/iteration': global_step
                 }
+                # Log encoder LR separately when using differential LR
+                if len(self.optimizer.param_groups) > 1:
+                    log_dict['train/encoder_lr'] = self.optimizer.param_groups[0]['lr']
                 # Add loss components to log dict
                 for component_name, component_value in loss_component_values.items():
                     log_dict[f'train/loss_{component_name}'] = component_value
@@ -689,44 +818,62 @@ class Trainer:
             leave=False
         )
         
+        is_text_prompted = hasattr(self.config, 'text_prompted') and self.config.text_prompted.enabled
+
         with torch.no_grad():
             for batch_idx, batch in enumerate(pbar):
                 images, targets = batch['image'], batch['label']
-                
-                if targets.dim() == 5 and targets.size(1) == 1:
-                    targets = targets.squeeze(1)
+                text_embedding = batch.get('text_embedding', None)
+
+                is_binary = self.config.data.num_classes == 1
+                if is_binary:
+                    if targets.dim() == 4:
+                        targets = targets.unsqueeze(1)
                 else:
-                    raise ValueError(f"Targets should have shape (B, 1, H, W, D), got {targets.shape}")
-                
+                    if targets.dim() == 5 and targets.size(1) == 1:
+                        targets = targets.squeeze(1)
+                    elif targets.dim() != 4:
+                        raise ValueError(f"Targets should have shape (B, 1, H, W, D) or (B, H, W, D), got {targets.shape}")
+
                 # Move to device (normalization now happens in dataset)
                 images = images.to(self.device)
                 targets = targets.to(self.device)
-                
+                if text_embedding is not None:
+                    text_embedding = text_embedding.to(self.device)
+
                 # Forward pass
-                outputs = self.model(images)
-                
+                if text_embedding is not None:
+                    outputs = self.model(images, text_embedding)
+                else:
+                    outputs = self.model(images)
+
                 if self.config.model.deep_supervision and isinstance(outputs, list):
                     main_output = outputs[0]
                 else:
                     main_output = outputs
 
                 loss, _ = self.val_loss(main_output, targets)
-                
-                # Update metrics
+
+                # Update metrics — squeeze targets to (B, H, W, D) for metric functions
                 loss_meter.update(loss.item(), images.size(0))
-                batch_metrics = self.val_metrics.update(main_output, targets)
+                targets_for_metrics = targets.squeeze(1) if is_binary else targets
+                batch_metrics = self.val_metrics.update(main_output, targets_for_metrics)
                 
                 current_loss = loss.item()
                 
                 # Save data for predetermined random batch
                 if batch_idx == display_batch_idx:
                     # Save all samples in this batch
-                    batch_probs = torch.softmax(main_output, dim=1)
-                    
+                    if is_binary:
+                        batch_probs = torch.sigmoid(main_output)
+                    else:
+                        batch_probs = torch.softmax(main_output, dim=1)
+
+                    targets_for_vis = targets_for_metrics  # (B, H, W, D)
                     for i in range(images.shape[0]):
                         img_slice, target_slice, pred_slice, _ = extract_slice_with_foreground(
                             images[i],
-                            targets[i],
+                            targets_for_vis[i],
                             batch_probs[i]
                         )
                         
@@ -807,15 +954,29 @@ class Trainer:
         else:
             print("Validation: DISABLED (train_on_all mode)")
 
+        # Run initial validation before training when using pretrained weights
+        if self.init_checkpoint is not None and not self.train_on_all and self.val_loader is not None and self.epoch == 0:
+            print(f"\n{'='*60}")
+            print("Running initial validation (pretrained weight baseline)")
+            print(f"{'='*60}")
+            init_val_metrics = self.validate_epoch()
+            init_dice = init_val_metrics.get('dice_mean', 0.0)
+            print(f"Pretrained baseline — val_dice: {init_dice:.4f}, val_loss: {init_val_metrics['loss']:.4f}")
+            if wandb.run is not None:
+                wandb.run.log({
+                    'epoch': -1,
+                    **{f'val/{k}': v for k, v in init_val_metrics.items()},
+                }, step=0)
+
         for epoch in range(self.epoch, self.config.training.max_epochs):
             self.epoch = epoch
             is_best = False
             epoch_start_time = time.time()
-            
+
             # Train
             train_metrics = self.train_epoch()
             self.metrics_history['train_loss'].append(train_metrics.get('loss', 0.0))
-            lr = self.optimizer.param_groups[0]['lr']
+            lr = self.optimizer.param_groups[-1]['lr']
             self.metrics_history['learning_rate'].append(lr)
 
             # Update learning rate

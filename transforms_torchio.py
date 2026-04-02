@@ -329,11 +329,12 @@ class OversizedCrop:
         target_shape_whd = np.array(self.target_size)  # (W, H, D)
         
         # For small volumes: use CropOrPad (center crop/pad)
+        # copy=True so the original base_subject is not modified in-place,
+        # which would corrupt subsequent patches from the same volume.
         if np.any(current_shape_whd < target_shape_whd):
             transform = tio.CropOrPad(
                 target_shape=tuple(target_shape_whd.tolist()),
                 padding_mode=self.padding_mode,
-                copy=False
             )
             return transform(subject)
         
@@ -387,7 +388,12 @@ class OversizedCrop:
         if 'weight_map' in subject:
             weight_map = subject['weight_map'][w_ini:w_ini + target_shape_whd[0], h_ini:h_ini + target_shape_whd[1], d_ini:d_ini + target_shape_whd[2]].data.clone()
             new_subject["weight_map"] = tio.ScalarImage(tensor=weight_map, affine=subject['weight_map'].affine)
-    
+
+        # Crop seg_cc (instance labels) if present (text-prompted mode)
+        if 'seg_cc' in subject:
+            seg_cc = subject['seg_cc'][w_ini:w_ini + target_shape_whd[0], h_ini:h_ini + target_shape_whd[1], d_ini:d_ini + target_shape_whd[2]].data.clone()
+            new_subject["seg_cc"] = tio.LabelMap(tensor=seg_cc, affine=subject['seg_cc'].affine)
+
         new_subject["case_id"] = subject['case_id']
         if 'foreground_coords' in subject:
                 new_subject['foreground_coords'] = subject['foreground_coords']
@@ -465,7 +471,7 @@ class OversizedCrop:
         
         if len(foreground_coords) == 0:
             # No foreground, fall back to uniform sampling
-            return self._sample_uniform_crop(volume_shape, target_shape)
+            return self._sample_uniform_crop(subject, volume_shape, target_shape)
         
         # Sample a random foreground voxel
         random_idx = np.random.randint(0, len(foreground_coords))
@@ -606,8 +612,8 @@ def get_training_transforms(config, oversize_factor: float = 1.25) -> tio.Compos
                 downsampling=(downsampling_min, downsampling_max),
                 image_interpolation='linear',
                 p=config.augmentation.simulate_low_res_prob,
-                include=['image'],  # Only apply to image, not weight_map
-                copy=False
+                include=['image'],  # Only apply to image, not label
+                copy=False,  # Fixed in TorchIO PR #1437
             )
         )
     

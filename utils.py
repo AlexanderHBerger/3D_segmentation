@@ -338,7 +338,11 @@ def extract_slice_with_foreground(image, target, pred_class, debug_dir='./debug_
     # target: (H, W, D)
     # prediction: (C, H, W, D)
 
-    pred_class = pred_class[1]  # Get class predictions (H, W, D)
+    # For multi-class: take class 1 (foreground). For binary (1 channel): take channel 0.
+    if pred_class.shape[0] == 1:
+        pred_class = pred_class[0]  # Binary sigmoid: single channel (H, W, D)
+    else:
+        pred_class = pred_class[1]  # Multi-class softmax: foreground class (H, W, D)
     
     # Remove channel dim from image if present
     if image.dim() == 4:

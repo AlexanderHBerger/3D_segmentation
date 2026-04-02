@@ -5,24 +5,59 @@ import torch
 import torch.nn as nn
 from typing import Optional
 
-from architectures import create_architecture, get_model_info as get_arch_info
+from architectures import create_architecture, get_network_parameters, get_model_info as get_arch_info
 
 def create_model(config) -> nn.Module:
     """
     Create model from configuration.
-    
+
     Supports multiple architectures:
     - PlainUNet: Plain UNet with constant conv blocks per stage
     - ResUNet: ResUNet with progressive residual blocks (nnUNet default)
     - Primus: Vision Transformer-based segmentation
     - MedNeXt: MedNeXt architecture (if available)
-    
+    - Text-prompted: VoxTell-style text-conditioned segmentation (ResUNet/PlainUNet)
+
     Args:
         config: Configuration object with model, data, and training settings
-    
+
     Returns:
         Initialized neural network model
     """
+    if hasattr(config, 'text_prompted') and config.text_prompted.enabled:
+        from text_prompted_model import TextPromptedModel
+
+        # Get encoder parameters from existing architecture factory
+        arch_params = get_network_parameters(
+            architecture=config.model.architecture,
+            model_size=config.model.model_size,
+            in_channels=config.model.in_channels,
+            n_classes=config.model.n_classes,
+            patch_size=config.data.patch_size,
+            kernel_size=config.model.kernel_size,
+            deep_supervision=config.model.deep_supervision,
+            primus_patch_embed_size=config.model.primus_patch_embed_size,
+        )
+
+        tp = config.text_prompted
+        model = TextPromptedModel(
+            arch_params=arch_params,
+            text_embedding_dim=tp.text_embedding_dim,
+            query_dim=tp.query_dim,
+            transformer_num_heads=tp.transformer_num_heads,
+            transformer_num_layers=tp.transformer_num_layers,
+            decoder_layer=tp.decoder_layer,
+            num_maskformer_stages=tp.num_maskformer_stages,
+            num_heads=tp.num_heads,
+            project_to_decoder_hidden_dim=tp.project_to_decoder_hidden_dim,
+            patch_size=config.data.patch_size,
+            deep_supervision=config.model.deep_supervision,
+        )
+
+        # Apply weight initialization
+        model.apply(model.initialize)
+        return model
+
     model = create_architecture(
         architecture=config.model.architecture,
         model_size=config.model.model_size,
@@ -33,7 +68,7 @@ def create_model(config) -> nn.Module:
         deep_supervision=config.model.deep_supervision,
         primus_patch_embed_size=config.model.primus_patch_embed_size
     )
-    
+
     return model
 
 

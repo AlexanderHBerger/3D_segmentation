@@ -28,15 +28,9 @@ from threading import Lock
 
 from config import Config, get_config
 from model import create_model
-from fast_preprocessing import (
-    create_brain_mask,
-    dilate_brain_mask,
-    normalize_image,
-    get_bbox_from_mask,
-    crop_to_bbox,
-    DATA_INTERPOLATION_ORDER
-)
 from nibabel.processing import resample_from_to
+
+DATA_INTERPOLATION_ORDER = 3  # Cubic interpolation for image data
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -47,6 +41,35 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 
+def crop_to_nonzero(image: np.ndarray, nonzero_threshold: float = 1e-5):
+    """
+    Crop a 3D array to the nonzero bounding box with hole-filling.
+
+    Matches VoxTell/nnUNet's crop_to_nonzero: creates a nonzero mask,
+    fills holes with binary_fill_holes, computes tight bounding box.
+
+    Args:
+        image: 3D image array (H, W, D)
+        nonzero_threshold: threshold for nonzero detection
+
+    Returns:
+        bbox: list of (start, stop) tuples per axis
+        nonzero_mask: bool array of same shape as input
+    """
+    nonzero_mask = np.abs(image) > nonzero_threshold
+    nonzero_mask = binary_fill_holes(nonzero_mask)
+
+    coords = np.argwhere(nonzero_mask)
+    if len(coords) == 0:
+        # Fallback: entire volume
+        return [(0, s) for s in image.shape], nonzero_mask
+
+    mins = coords.min(axis=0)
+    maxs = coords.max(axis=0) + 1  # exclusive upper bound
+    bbox = [(int(mn), int(mx)) for mn, mx in zip(mins, maxs)]
+    return bbox, nonzero_mask
+
+
 def preprocess_case_for_inference(
     image_path: str,
     target_spacing: Tuple[float, float, float],
@@ -55,179 +78,137 @@ def preprocess_case_for_inference(
     output_dir: Optional[Path] = None
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
     """
-    Preprocess a single case for inference.
+    Preprocess a single case for inference (VoxTell-compatible global ZScore).
+
+    Pipeline:
     1. Load NIfTI
     2. Convert to canonical orientation (RAS+)
-    3. Create brain mask on canonical data
-    4. Dilate brain mask
-    5. Resample image (with anisotropy handling) and brain mask to target spacing
-    6. Normalize AFTER resampling using brain mask
-    7. Convert to tensor
-    
+    3. Resample to target spacing
+    4. Crop to nonzero region (with hole-filling)
+    5. Global ZScore normalization on cropped volume
+    6. Convert to tensor
+
     Args:
         image_path: Path to input NIfTI file
         target_spacing: Target voxel spacing (x, y, z)
         verbose: Print detailed info
         save_preprocessed: Save preprocessed image as NIfTI for debugging
         output_dir: Directory to save preprocessed images (if save_preprocessed=True)
-        
+
     Returns:
         preprocessed_tensor: Shape (1, H, W, D) - ready for model
         metadata: Dict with original image info and preprocessing steps for reverting
     """
     if verbose:
         logger.info(f"Preprocessing {Path(image_path).name}")
-    
+
     # 1. Load image
     nii_img = nib.load(image_path)
     original_affine = nii_img.affine.copy()
     original_shape = nii_img.shape
     original_spacing = nii_img.header.get_zooms()[:3]
-    
+
     if verbose:
         logger.info(f"  Original: shape={original_shape}, spacing={original_spacing}")
-    
+
     # 2. Convert to canonical orientation (RAS+)
     if verbose:
         logger.info(f"  Converting to canonical orientation (RAS+)")
     img_canonical = nib.as_closest_canonical(nii_img)
-    
-    # 3. Create brain mask on canonical data (BEFORE resampling)
-    if verbose:
-        logger.info(f"  Creating brain mask on canonical data")
-    image_canonical_data = img_canonical.get_fdata().astype(np.float32)
-    brain_mask_canonical = create_brain_mask(image_canonical_data)
-    
-    # 4. Dilate brain mask to include border regions
-    if verbose:
-        logger.info(f"  Dilating brain mask")
-    brain_mask_canonical = dilate_brain_mask(brain_mask_canonical)
-    
-    # Convert brain mask to NIfTI for resampling
-    brain_mask_nib = nib.Nifti1Image(
-        brain_mask_canonical.astype(np.uint8),
-        affine=img_canonical.affine,
-        header=img_canonical.header
-    )
-    
-    # 5. Resample to target spacing (with anisotropy handling like training)
+
+    # 3. Resample to target spacing
     if verbose:
         logger.info(f"  Resampling to target spacing {target_spacing}")
-    
+
     current_spacing = img_canonical.header.get_zooms()[:3]
-    
-    # Check for anisotropy (nnUNet approach - same as training)
+
+    # Check for anisotropy (nnUNet approach)
     if np.max(current_spacing) / np.min(current_spacing) > 3:
         if verbose:
             logger.info(f"    Data is highly anisotropic. Using two-stage resampling.")
-        
+
         low_res_axis = np.argmax(current_spacing)
-        
-        # Create intermediate spacing: target for in-plane, original for out-of-plane
         intermediate_spacing = list(current_spacing)
         intermediate_spacing[low_res_axis] = target_spacing[low_res_axis]
-        
+
         if verbose:
             logger.info(f"    Low res axis: {low_res_axis}, intermediate spacing: {intermediate_spacing}")
-        
-        # 1. Resample out-of-plane with nearest neighbor
+
         img_intermediate = nib.processing.resample_to_output(
-            img_canonical,
-            voxel_sizes=intermediate_spacing,
-            order=0  # Nearest neighbor for out-of-plane
+            img_canonical, voxel_sizes=intermediate_spacing, order=0
         )
-        
-        # 2. Resample in-plane with cubic interpolation
         img_resampled = nib.processing.resample_to_output(
-            img_intermediate,
-            voxel_sizes=target_spacing,
-            order=DATA_INTERPOLATION_ORDER
+            img_intermediate, voxel_sizes=target_spacing, order=DATA_INTERPOLATION_ORDER
         )
     else:
-        # Single-stage resampling
         img_resampled = nib.processing.resample_to_output(
-            img_canonical,
-            voxel_sizes=target_spacing,
-            order=DATA_INTERPOLATION_ORDER
+            img_canonical, voxel_sizes=target_spacing, order=DATA_INTERPOLATION_ORDER
         )
-    
-    # Resample brain mask to match image grid exactly
-    if verbose:
-        logger.info(f"    Resampling brain mask to match image geometry")
-    brain_mask_resampled = resample_from_to(
-        brain_mask_nib,
-        img_resampled,
-        order=0  # Nearest neighbor for binary mask
-    )
-    
-    # Get numpy arrays
+
     image = img_resampled.get_fdata().astype(np.float32)
-    brain_mask = brain_mask_resampled.get_fdata().astype(bool)
     resampled_affine = img_resampled.affine
     resampled_shape = image.shape
-    
-    # 6. Normalize AFTER resampling (CRITICAL: matches training)
+
     if verbose:
-        logger.info(f"  Normalizing using brain mask (after resampling)")
-    image = normalize_image(image, brain_mask)
-    
-    # 7. Crop to brain region (matches training pipeline)
+        logger.info(f"  Resampled: shape={resampled_shape}")
+
+    # 4. Crop to nonzero region (with hole-filling, matches VoxTell/training)
     if verbose:
-        logger.info(f"  Cropping to brain region")
-    bbox = get_bbox_from_mask(brain_mask)
-    
-    image_cropped = crop_to_bbox(image, bbox)
-    brain_mask_cropped = crop_to_bbox(brain_mask, bbox)
+        logger.info(f"  Cropping to nonzero region")
+    bbox, nonzero_mask = crop_to_nonzero(image)
+
+    image_cropped = image[bbox[0][0]:bbox[0][1], bbox[1][0]:bbox[1][1], bbox[2][0]:bbox[2][1]]
     cropped_shape = image_cropped.shape
-    
+
     if verbose:
         logger.info(f"  Cropped: shape={cropped_shape} (was {resampled_shape})")
-    
+
+    # 5. Global ZScore normalization on cropped volume (VoxTell-compatible)
     if verbose:
-        logger.info(f"  Preprocessed: shape={('1',) + cropped_shape}")
-    
+        logger.info(f"  Global ZScore normalization")
+    mean_val = image_cropped.mean()
+    std_val = image_cropped.std()
+    if std_val > 1e-8:
+        image_cropped = (image_cropped - mean_val) / std_val
+    else:
+        image_cropped = image_cropped - mean_val
+
+    if verbose:
+        logger.info(f"  Preprocessed: shape={(1,) + cropped_shape}")
+
     # Save preprocessed image for debugging if requested
     if save_preprocessed and output_dir is not None:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        
+
         case_name = Path(image_path).name.replace('.nii.gz', '').replace('_0000', '')
-        
-        # Save normalized + resampled image
+
         preprocessed_path = output_dir / f"{case_name}_preprocessed.nii.gz"
-        preprocessed_nii = nib.Nifti1Image(image, affine=resampled_affine)
-        nib.save(preprocessed_nii, preprocessed_path)
-        
-        # Save brain mask (cropped)
-        mask_path = output_dir / f"{case_name}_brain_mask.nii.gz"
-        # Create affine for cropped data
         cropped_affine = resampled_affine.copy()
-        offset = np.array([bbox[0][0], bbox[1][0], bbox[2][0], 0])
-        cropped_affine[:, 3] = resampled_affine @ np.append(offset[:3], 1)
-        mask_nii = nib.Nifti1Image(brain_mask_cropped.astype(np.uint8), affine=cropped_affine)
-        nib.save(mask_nii, mask_path)
-        
+        offset = np.array([bbox[0][0], bbox[1][0], bbox[2][0]])
+        cropped_affine[:3, 3] = resampled_affine[:3, :3] @ offset + resampled_affine[:3, 3]
+        preprocessed_nii = nib.Nifti1Image(image_cropped, affine=cropped_affine)
+        nib.save(preprocessed_nii, preprocessed_path)
+
         if verbose:
             logger.info(f"  Saved preprocessed image to: {preprocessed_path}")
-            logger.info(f"  Saved brain mask to: {mask_path}")
-    
-    # 8. Convert to tensor
+
+    # 6. Convert to tensor
     image_tensor = torch.from_numpy(image_cropped).float()
     image_tensor = image_tensor.unsqueeze(0)  # Add channel dimension
-    
-    # Store properties for reverting (only essential info, not full NIfTI)
+
+    # Store properties for reverting
     properties = {
         'original_affine': original_affine,
         'original_shape': original_shape,
         'original_spacing': original_spacing,
         'resampled_affine': resampled_affine,
         'resampled_shape': resampled_shape,
-        'brain_mask_resampled': brain_mask,  # Store full resampled version (not cropped)
-        'bbox_used_for_cropping': bbox,  # Store bbox for padding back
+        'nonzero_mask_resampled': nonzero_mask,
+        'bbox_used_for_cropping': bbox,
         'cropped_shape': cropped_shape,
-        'brain_mask_cropped': brain_mask_cropped  # Store cropped brain mask
     }
-    
+
     return image_tensor, properties
 
 
@@ -266,6 +247,34 @@ def create_predictor_wrapper(model: torch.nn.Module) -> Callable:
     return predictor
 
 
+def create_text_prompted_predictor(
+    model: torch.nn.Module,
+    text_embeddings: torch.Tensor,
+) -> Callable:
+    """
+    Create a predictor for text-prompted segmentation.
+
+    The text embeddings are constant across all sliding windows, so they
+    are captured in the closure and expanded to match the batch size.
+
+    Args:
+        model: The text-prompted segmentation model.
+        text_embeddings: (1, N, embedding_dim) precomputed text embeddings.
+
+    Returns:
+        Predictor function compatible with MONAI's sliding_window_inference.
+    """
+    def predictor(patch_data: torch.Tensor) -> torch.Tensor:
+        B = patch_data.shape[0]
+        text_emb = text_embeddings.expand(B, -1, -1).to(patch_data.device)
+        output = model(patch_data, text_emb)
+        if isinstance(output, (list, tuple)):
+            output = output[0]
+        return output
+
+    return predictor
+
+
 # =============================================================================
 # Postprocessing (Revert preprocessing to get final segmentation)
 # =============================================================================
@@ -282,20 +291,20 @@ def postprocess_prediction(
 ) -> nib.Nifti1Image:
     """
     Postprocess prediction to original image space.
-    
+
     Steps (reverse of preprocessing):
-    1. Pad logits back to full resampled size (reverse of cropping)
-       - Background class logits outside brain: set to dtype max (high confidence background)
-       - Foreground class logits outside brain: set to dtype min (low confidence foreground)
+    1. Pad logits back to full resampled size (reverse of nonzero cropping)
+       - Background class logits outside region: set to dtype max (high confidence background)
+       - Foreground class logits outside region: set to dtype min (low confidence foreground)
     2. Apply argmax to get segmentation
-    3. Set pixels outside brain mask to -1 (for evaluation)
+    3. Set pixels outside nonzero mask to -1 (for evaluation)
     4. Resample back to original spacing
     5. Optionally save logits and/or probabilities in original space
-    
+
     For probabilities: softmax is applied BEFORE resampling to preserve probability
     distributions. Each channel is resampled independently with linear interpolation.
     After resampling, probabilities are re-normalized to sum to 1.
-    
+
     Args:
         predicted_logits: Predicted logits of shape (num_classes, X, Y, Z) - cropped
         properties: Properties dict from preprocessing
@@ -305,36 +314,32 @@ def postprocess_prediction(
         filter_to_brain: Filter to brain mask before resampling (now always done via -1)
         save_logits: Save logits in original image space
         save_probabilities: Save probability maps (via softmax) in original image space
-        
+
     Returns:
-        Final segmentation in original image space (with -1 outside brain mask)
+        Final segmentation in original image space (with -1 outside nonzero mask)
     """
     logger.info(f"  Postprocessing prediction")
-    
+
     # Step 0: Pad logits back to full resampled size (reverse of cropping)
     bbox = properties.get('bbox_used_for_cropping')
     resampled_shape = properties['resampled_shape']
-    brain_mask_full = properties['brain_mask_resampled']
+    nonzero_mask_full = properties.get('nonzero_mask_resampled',
+                                       properties.get('brain_mask_resampled'))
     num_classes = predicted_logits.shape[0]
-    
+
     if bbox is not None:
         logger.info(f"    Padding logits from cropped {tuple(predicted_logits.shape[1:])} to full {resampled_shape}")
-        
-        # Create full-size logits array
-        # Use float32 to get proper min/max values
+
         predicted_logits_np = predicted_logits.cpu().numpy().astype(np.float32)
         logits_dtype_info = np.finfo(np.float32)
-        
-        # Convert resampled_shape to tuple if it's a list/array
+
         resampled_shape_tuple = tuple(resampled_shape)
-        
-        # Initialize full logits with appropriate values for background outside brain:
-        # - Background class (0): high logit (dtype max) -> high confidence for background
-        # - Foreground classes (1+): low logit (dtype min) -> low confidence for foreground
+
+        # Initialize full logits: background high, foreground low outside crop region
         full_logits = np.zeros((num_classes,) + resampled_shape_tuple, dtype=np.float32)
-        full_logits[0, :, :, :] = logits_dtype_info.max  # Background class gets max value
-        full_logits[1:, :, :, :] = logits_dtype_info.min  # Foreground classes get min value
-        
+        full_logits[0, :, :, :] = logits_dtype_info.max
+        full_logits[1:, :, :, :] = logits_dtype_info.min
+
         # Copy cropped logits into the correct position
         full_logits[
             :,
@@ -342,23 +347,20 @@ def postprocess_prediction(
             bbox[1][0]:bbox[1][1],
             bbox[2][0]:bbox[2][1]
         ] = predicted_logits_np
-        
-        # Convert back to tensor
+
         predicted_logits = torch.from_numpy(full_logits)
-        
+
         logger.info(f"    Padded logits shape: {predicted_logits.shape}")
-    
+
     # Step 1: Convert logits to segmentation
-    # Argmax to get class labels (no softmax needed, just argmax)
     segmentation = torch.argmax(predicted_logits, dim=0).cpu().numpy()
-    
+
     logger.info(f"    After argmax: shape={segmentation.shape}")
-    
-    # Step 1a: Set pixels outside brain mask to -1 (for evaluation)
-    # Use int8 to support -1 value
+
+    # Step 1a: Set pixels outside nonzero mask to -1 (for evaluation)
     segmentation = segmentation.astype(np.int8)
-    segmentation[~brain_mask_full] = -1
-    logger.info(f"    Set {(~brain_mask_full).sum()} pixels outside brain mask to -1")
+    segmentation[~nonzero_mask_full] = -1
+    logger.info(f"    Set {(~nonzero_mask_full).sum()} pixels outside nonzero mask to -1")
     
     # Step 1b: Compute probabilities via softmax BEFORE any resampling
     # This preserves proper probability distributions
@@ -781,7 +783,7 @@ class Predictor:
         
         # Load checkpoint
         checkpoint = torch.load(self.checkpoint_path, map_location='cpu', weights_only=False)
-        
+
         # Load or use provided config
         if config is None:
             if 'config' in checkpoint:
@@ -792,11 +794,11 @@ class Predictor:
                 self.config = get_config()
         else:
             self.config = config
-        
+
         # Create model
         logger.info("Creating model")
         self.model = create_model(self.config)
-        
+
         # Load weights
         if 'model_state_dict' in checkpoint:
             self.model.load_state_dict(checkpoint['model_state_dict'])
@@ -804,9 +806,13 @@ class Predictor:
             self.model.load_state_dict(checkpoint['state_dict'])
         else:
             raise ValueError("Could not find model weights in checkpoint")
-        
+
         logger.info(f"Checkpoint loaded (epoch {checkpoint.get('epoch', 'unknown')})")
-        
+
+        # Detect text-prompted mode
+        self.is_text_prompted = getattr(self.config, 'text_prompted', None) is not None \
+            and self.config.text_prompted.enabled
+
         # Move to device
         self.model = self.model.to(self.device)
         self.model.eval()
@@ -911,7 +917,115 @@ class Predictor:
             nib.save(seg_nib, output_path)
         
         return seg_nib
-    
+
+    def predict_case_text_prompted(
+        self,
+        image_path: Path,
+        text_prompts: List[str],
+        precomputed_embeddings: Optional[Dict[str, torch.Tensor]] = None,
+        output_dir: Optional[Path] = None,
+    ) -> Tuple[Dict[str, np.ndarray], np.ndarray, dict]:
+        """
+        Predict a single case using text-prompted segmentation.
+
+        Args:
+            image_path: Path to input NIfTI image
+            text_prompts: List of text prompt strings
+            precomputed_embeddings: Optional dict mapping prompt text -> embedding tensor.
+                If None, prompts are encoded at runtime using the text encoder.
+            output_dir: Optional directory to save per-prompt binary masks
+
+        Returns:
+            masks_dict: Dict mapping prompt text -> binary mask (H, W, D) in cropped space
+            preprocessed_image: Preprocessed image numpy array (H, W, D) for visualization
+            properties: Preprocessing metadata for reverting to original space
+        """
+        logger.info(f"\nText-prompted prediction for {image_path.name}")
+        logger.info(f"  Prompts: {text_prompts}")
+
+        # 1. Preprocess (same global ZScore pipeline)
+        image, properties = preprocess_case_for_inference(
+            str(image_path),
+            target_spacing=self.config.data.target_spacing,
+            verbose=self.verbose,
+        )
+
+        # 2. Build text embeddings: (1, N, embedding_dim)
+        if precomputed_embeddings is not None:
+            embeddings_list = []
+            for prompt in text_prompts:
+                if prompt in precomputed_embeddings:
+                    embeddings_list.append(precomputed_embeddings[prompt])
+                else:
+                    raise ValueError(
+                        f"Prompt '{prompt}' not found in precomputed embeddings. "
+                        f"Available: {list(precomputed_embeddings.keys())[:5]}..."
+                    )
+            text_embeddings = torch.stack(embeddings_list).unsqueeze(0)  # (1, N, dim)
+        else:
+            from text_embedding import TextEncoder
+            encoder_model = getattr(self.config.text_prompted, 'text_encoder_model',
+                                    'Qwen/Qwen3-Embedding-4B')
+            logger.info(f"  Encoding prompts with {encoder_model}")
+            text_encoder = TextEncoder(model_name=encoder_model, device=self.device)
+            text_embeddings = text_encoder.encode_prompts(text_prompts)  # (1, N, dim)
+
+        text_embeddings = text_embeddings.to(self.device)
+
+        # 3. Create text-prompted predictor wrapper
+        predictor = create_text_prompted_predictor(self.model, text_embeddings)
+
+        # 4. Sliding window inference
+        image_tensor = image.unsqueeze(0).to(self.device)  # (1, C, H, W, D)
+
+        with torch.no_grad():
+            if self.verbose:
+                logger.info(f"  Running sliding window inference:")
+                logger.info(f"    Input shape: {image_tensor.shape}")
+                logger.info(f"    Patch size: {self.config.data.patch_size}")
+
+            predicted_logits = sliding_window_inference(
+                inputs=image_tensor,
+                roi_size=self.config.data.patch_size,
+                sw_batch_size=self.sw_batch_size,
+                predictor=predictor,
+                overlap=1.0 - self.tile_step_size,
+                mode="gaussian" if self.use_gaussian else "constant",
+                sigma_scale=0.125,
+                padding_mode="constant",
+                cval=0.0,
+                sw_device=self.device,
+                device=self.device,
+                progress=self.verbose
+            )
+
+        # 5. Sigmoid + threshold per prompt -> binary masks
+        predicted_logits = predicted_logits[0].cpu()  # (N, H, W, D)
+        probabilities = torch.sigmoid(predicted_logits).numpy()
+
+        masks_dict = {}
+        for i, prompt in enumerate(text_prompts):
+            binary_mask = (probabilities[i] > 0.5).astype(np.uint8)
+            masks_dict[prompt] = binary_mask
+            logger.info(f"  Prompt '{prompt}': {binary_mask.sum()} positive voxels")
+
+        # 6. Save if requested
+        if output_dir is not None:
+            output_dir = Path(output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            case_name = image_path.name.replace('.nii.gz', '').replace('_0000', '')
+
+            spacing = self.config.data.target_spacing
+            affine = np.diag([*spacing, 1.0])
+
+            for i, (prompt, mask) in enumerate(masks_dict.items()):
+                out_path = output_dir / f"{case_name}_prompt{i}.nii.gz"
+                nib.save(nib.Nifti1Image(mask, affine=affine), out_path)
+                logger.info(f"  Saved: {out_path}")
+
+        preprocessed_image = image[0].numpy()  # (H, W, D)
+        return masks_dict, preprocessed_image, properties
+
     def predict_from_folder(
         self,
         input_folder: Path,
@@ -1348,7 +1462,28 @@ def main():
         metavar=('H', 'W', 'D'),
         help='Override patch size from config (e.g., --patch_size 128 128 128)'
     )
-    
+
+    # Text-prompted inference arguments
+    parser.add_argument(
+        '--text_prompts',
+        type=str,
+        nargs='+',
+        default=None,
+        help='Text prompts for text-prompted segmentation (e.g., --text_prompts "liver" "kidney")'
+    )
+    parser.add_argument(
+        '--text_encoder_model',
+        type=str,
+        default='Qwen/Qwen3-Embedding-4B',
+        help='Text encoder model for computing embeddings at inference time'
+    )
+    parser.add_argument(
+        '--precomputed_embeddings',
+        type=str,
+        default=None,
+        help='Path to precomputed text embeddings .pt file (alternative to --text_prompts)'
+    )
+
     args = parser.parse_args()
     
     # Convert patch_size to tuple if provided
@@ -1375,14 +1510,38 @@ def main():
     )
     
     # Run prediction
-    predictor.predict_from_folder(
-        input_folder=Path(args.input_folder),
-        output_folder=Path(args.output_folder),
-        file_pattern=args.file_pattern,
-        max_samples=args.max_samples,
-        random_seed=args.seed,
-        sample_list=args.sample_list
-    )
+    if args.text_prompts and predictor.is_text_prompted:
+        # Text-prompted inference mode
+        precomputed_embeddings = None
+        if args.precomputed_embeddings:
+            logger.info(f"Loading precomputed embeddings from {args.precomputed_embeddings}")
+            precomputed_embeddings = torch.load(
+                args.precomputed_embeddings, map_location='cpu', weights_only=True
+            )
+
+        input_folder = Path(args.input_folder)
+        output_folder = Path(args.output_folder)
+        output_folder.mkdir(parents=True, exist_ok=True)
+
+        input_files = sorted(input_folder.glob(args.file_pattern))
+        logger.info(f"Text-prompted inference on {len(input_files)} files with prompts: {args.text_prompts}")
+
+        for image_path in tqdm(input_files, desc="Text-prompted inference"):
+            predictor.predict_case_text_prompted(
+                image_path=image_path,
+                text_prompts=args.text_prompts,
+                precomputed_embeddings=precomputed_embeddings,
+                output_dir=output_folder,
+            )
+    else:
+        predictor.predict_from_folder(
+            input_folder=Path(args.input_folder),
+            output_folder=Path(args.output_folder),
+            file_pattern=args.file_pattern,
+            max_samples=args.max_samples,
+            random_seed=args.seed,
+            sample_list=args.sample_list
+        )
 
 
 if __name__ == "__main__":

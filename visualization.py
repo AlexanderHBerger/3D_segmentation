@@ -59,6 +59,9 @@ class TrainingVisualizer:
         # Move to CPU and convert to numpy
         images_np = images.detach().cpu().numpy()
         targets_np = targets.detach().cpu().numpy()
+        # Squeeze channel dim for binary targets (B, 1, H, W, D) -> (B, H, W, D)
+        if targets_np.ndim == 5 and targets_np.shape[1] == 1:
+            targets_np = targets_np[:, 0]
         
         # Handle outputs (could be logits or list for deep supervision)
         if isinstance(outputs, list):

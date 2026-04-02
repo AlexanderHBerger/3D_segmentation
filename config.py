@@ -25,7 +25,7 @@ class DataConfig:
     target_spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0)
     
     # Patch configuration from nnUNet 3d_fullres
-    patch_size: Tuple[int, int, int] = (128, 128, 128)
+    patch_size: Tuple[int, int, int] = (192, 192, 192)
 
     # Normalization (nnUNet uses ZScore with mask)
     normalization_scheme: str = "zscore"
@@ -88,15 +88,23 @@ class TrainingConfig:
     patches_per_volume: int = 10   # nnUNet uses 4 patches per volume for 3d_fullres
     
     # Training parameters
-    max_epochs: int = 250
+    max_epochs: int = 1000
     num_iterations_per_epoch: int = 250  # nnUNet uses fixed 250 iterations per epoch
-    initial_lr: float = 0.015
+    initial_lr: float = 0.001
     weight_decay: float = 5e-5
     momentum: float = 0.99
     
     # Warm restart parameters (for continuing training with extended epochs)
     warm_restart_lr_factor: float = 0.4  # Multiplier for initial LR on warm restart
-    
+
+    # Finetuning / transfer learning
+    freeze_encoder: bool = False        # Freeze all encoder parameters (requires_grad=False)
+    encoder_lr_factor: float = 1.0      # Encoder LR = initial_lr * this factor; ignored when freeze_encoder=True
+    lora_enabled: bool = False           # Apply LoRA to transformer decoder attention layers
+    lora_rank: int = 16                  # LoRA rank (lower = fewer params, higher = more expressive)
+    lora_alpha: float = 32.0             # LoRA scaling factor (alpha/rank is the effective scale)
+    lora_dropout: float = 0.0            # Dropout on LoRA adapter layers
+
     # Foreground oversampling (nnUNet uses 0.33)
     oversample_foreground_percent: float = 0.33  # Always sample foreground patches
     
@@ -205,6 +213,35 @@ class AugmentationConfig:
 
 
 @dataclass
+class TextPromptedConfig:
+    """Configuration for text-prompted segmentation mode (VoxTell-style)"""
+    enabled: bool = False
+
+    # Text encoder
+    text_encoder_model: str = "Qwen/Qwen3-Embedding-4B"
+    text_embedding_dim: int = 2560  # Output dim of Qwen3-Embedding-4B
+    precomputed_embeddings_path: Optional[str] = None  # Path to .pt file with precomputed embeddings
+
+    # Transformer decoder (text-image fusion)
+    query_dim: int = 2048
+    transformer_num_heads: int = 8
+    transformer_num_layers: int = 6
+    decoder_layer: int = 4  # Which encoder stage to use as spatial context for transformer
+
+    # VoxTell-style decoder
+    num_maskformer_stages: int = 5
+    num_heads: int = 32  # Fusion channels per decoder stage
+    project_to_decoder_hidden_dim: int = 2048
+
+    # Data pipeline
+    prompt_csv_dir: Optional[str] = None  # Directory with per-sample CSV prompt files
+    prompts_json_path: Optional[str] = None  # Path to generated prompts JSON
+    instance_labels_suffix: str = "_cc"  # Suffix for connected component instance labels
+    atlas_labels_suffix: str = "_atlas"  # Suffix for atlas region labels
+    max_prompts_per_sample: int = 1  # Number of text prompts per training sample
+
+
+@dataclass
 class WandbConfig:
     """Weights & Biases configuration"""
     project: str = "3D-Segmentation"
@@ -224,6 +261,7 @@ class Config:
     model: ModelConfig = field(default_factory=ModelConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     augmentation: AugmentationConfig = field(default_factory=AugmentationConfig)
+    text_prompted: TextPromptedConfig = field(default_factory=TextPromptedConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)
     
     # General settings
@@ -233,7 +271,7 @@ class Config:
     
     # GPU settings
     device: str = "cuda"
-    mixed_precision: bool = False
+    mixed_precision: bool = True
     
     # Output directory
     output_dir: str = "./experiments"
@@ -276,6 +314,43 @@ class Config:
                 print("="*80 + "\n")
                 self.training.exponential_correction = 50
         
+        # Validate text-prompted configuration
+        if self.text_prompted.enabled:
+            arch = self.model.architecture.lower()
+            if arch not in ['resunet', 'residual_unet', 'residual', 'plainunet', 'plain_unet', 'plain']:
+                raise ValueError(
+                    f"Text-prompted mode only supports ResUNet or PlainUNet, "
+                    f"got architecture='{self.model.architecture}'"
+                )
+            from architectures import calculate_n_stages
+            n_stages = calculate_n_stages(self.data.patch_size)
+            if self.text_prompted.decoder_layer >= n_stages:
+                print(f"\nWARNING: decoder_layer ({self.text_prompted.decoder_layer}) >= "
+                      f"n_stages ({n_stages}). Clamping to {n_stages - 1}.")
+                self.text_prompted.decoder_layer = n_stages - 1
+
+            # Text-prompted uses single-channel sigmoid output (binary per-prompt)
+            if self.data.num_classes != 1:
+                print(f"NOTE: Setting num_classes=1 for text-prompted mode (was {self.data.num_classes})")
+                self.data.num_classes = 1
+
+            # Disable mirror augmentation: flipping breaks location-specific prompts
+            # (e.g., "left frontal" becomes right frontal after L-R flip)
+            if self.augmentation.mirror_prob > 0:
+                print("NOTE: Disabling mirror augmentation (incompatible with location-specific text prompts)")
+                self.augmentation.mirror_prob = 0.0
+
+        # Validate finetuning configuration
+        if self.training.encoder_lr_factor < 0:
+            raise ValueError(f"encoder_lr_factor must be >= 0, got {self.training.encoder_lr_factor}")
+        if self.training.encoder_lr_factor == 0.0 and not self.training.freeze_encoder:
+            print("NOTE: encoder_lr_factor=0.0 is equivalent to freezing — setting freeze_encoder=True")
+            self.training.freeze_encoder = True
+        if self.training.freeze_encoder and self.training.encoder_lr_factor != 1.0:
+            print("NOTE: encoder_lr_factor is ignored when freeze_encoder=True")
+        if self.training.lora_enabled and not self.text_prompted.enabled:
+            raise ValueError("LoRA requires text-prompted mode (--text_prompted) since it targets the transformer decoder")
+
         # Warn if tversky_beta is set to non-default but loss is not tversky
         if self.training.tversky_beta != 0.5:
             if self.training.loss_function not in ["tversky", "tversky_ce"]:

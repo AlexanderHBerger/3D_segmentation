@@ -77,6 +77,27 @@ def main():
     parser.add_argument('--train_on_all', action='store_true',
                         help='Train on all data (train + val combined, no validation). Ignores --fold.')
 
+    parser.add_argument('--data_path', type=str, default=None,
+                        help='Override data path (preprocessed directory)')
+
+    # Text-prompted mode arguments
+    parser.add_argument('--text_prompted', action='store_true',
+                        help='Enable text-prompted segmentation mode (VoxTell-style)')
+    parser.add_argument('--precomputed_embeddings', type=str, default=None,
+                        help='Path to precomputed text embeddings .pt file')
+    parser.add_argument('--prompts_json', type=str, default=None,
+                        help='Path to prompts JSON file (maps case_id -> prompts)')
+
+    # Finetuning arguments
+    parser.add_argument('--freeze_encoder', action='store_true',
+                        help='Freeze encoder weights (only train decoder/transformer/projections)')
+    parser.add_argument('--encoder_lr_factor', type=float, default=None,
+                        help='Differential LR factor for encoder (e.g., 0.1 = encoder trains 10x slower)')
+    parser.add_argument('--lora', action='store_true',
+                        help='Apply LoRA to transformer decoder attention layers')
+    parser.add_argument('--lora_rank', type=int, default=None,
+                        help='LoRA rank (default: 16)')
+
     args = parser.parse_args()
     
     # Validate config loading
@@ -132,15 +153,43 @@ def main():
             config.data.max_samples = args.max_samples
             print(f"Max samples mode enabled: limiting to {args.max_samples} samples per split")
 
+    if args.data_path is not None:
+        config.data.data_path = args.data_path
+
+    # Text-prompted mode overrides (always applied)
+    if args.text_prompted:
+        config.text_prompted.enabled = True
+        print("Text-prompted segmentation mode ENABLED")
+    if args.precomputed_embeddings is not None:
+        config.text_prompted.precomputed_embeddings_path = args.precomputed_embeddings
+    if args.prompts_json is not None:
+        config.text_prompted.prompts_json_path = args.prompts_json
+
+    # Finetuning overrides (always applied)
+    if args.freeze_encoder:
+        config.training.freeze_encoder = True
+    if args.encoder_lr_factor is not None:
+        config.training.encoder_lr_factor = args.encoder_lr_factor
+    if args.lora:
+        config.training.lora_enabled = True
+    if args.lora_rank is not None:
+        config.training.lora_rank = args.lora_rank
+
     # train_on_all is always applied (even on resume — data split is not stored in checkpoint)
     if args.train_on_all:
         config.data.train_on_all = True
 
+    # Re-run __post_init__ validation now that all CLI overrides are applied.
+    # This is needed because __post_init__ ran at Config() construction time,
+    # before CLI flags like --text_prompted were set.
+    config.__post_init__()
+
     # Debug mode adjustments
     if args.debug:
-        config.training.max_epochs = 10
-        config.training.val_check_interval = 2
-        print("Debug mode enabled: reduced epochs and val interval")
+        config.training.max_epochs = 2
+        config.training.num_iterations_per_epoch = 5
+        config.training.val_check_interval = 1
+        print("Debug mode enabled: 2 epochs, 5 iters/epoch, validate every epoch")
     
     # Enable visualization if requested (or automatically in debug mode)
     enable_visualization = args.visualize or args.debug
@@ -156,10 +205,7 @@ def main():
         # Offline mode - use fixed run_id
         run_id = "offline_run"
         print("Wandb logging disabled - using offline_run as run_id")
-        import wandb
-        wandb.init = lambda **kwargs: None
-        wandb.log = lambda *args, **kwargs: None
-        wandb.finish = lambda: None
+        os.environ['WANDB_MODE'] = 'disabled'
     else:
         # New run - will be set after wandb.init
         run_id = None

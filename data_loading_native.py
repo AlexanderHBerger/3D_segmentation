@@ -186,7 +186,11 @@ class PatchDataset(IterableDataset):
         foreground_oversample_percent: Optional[float] = 0.33,
         oversize_factor: Optional[float] = 1.2,
         compute_valid_bounds: bool = False,
-        verbose: bool = False
+        verbose: bool = False,
+        # Text-prompted mode parameters
+        text_prompted: bool = False,
+        precomputed_embeddings: Optional[Dict[str, 'torch.Tensor']] = None,
+        prompts_data: Optional[Dict[str, list]] = None,
     ):
         """
         Args:
@@ -254,13 +258,29 @@ class PatchDataset(IterableDataset):
         )
 
         self.executor = ThreadPoolExecutor(max_workers=1)
-        
+
+        # Text-prompted mode
+        self.text_prompted = text_prompted
+        self.precomputed_embeddings = precomputed_embeddings
+        self.prompts_data = prompts_data
+        if text_prompted:
+            assert precomputed_embeddings is not None, "precomputed_embeddings required for text-prompted mode"
+            assert prompts_data is not None, "prompts_data required for text-prompted mode"
+
+        # For validation text-prompted: precompute total prompt count for accurate __len__
+        self._val_tp_total_prompts = None
+        if not is_training and text_prompted and prompts_data:
+            self._val_tp_total_prompts = sum(
+                len(self._select_validation_prompts(cid)) for cid in case_ids
+            )
+
         # Epoch counter for proper shuffling across epochs
         # IMPORTANT: Call set_epoch(epoch) before each epoch to ensure different shuffling
         self._epoch = 0
-        
+
         mode_str = "training" if is_training else "validation"
-        print(f"PatchDataset ({mode_str}) initialized: {len(case_ids)} cases, "
+        tp_str = " [text-prompted]" if text_prompted else ""
+        print(f"PatchDataset ({mode_str}{tp_str}) initialized: {len(case_ids)} cases, "
               f"{patches_per_volume} patches/volume, "
               f"virtual size = {len(self)}")
     
@@ -291,6 +311,130 @@ class PatchDataset(IterableDataset):
         
         return torch.tensor([mins[0], maxs[0], mins[1], maxs[1], mins[2], maxs[2]], dtype=torch.long)
     
+    def _select_validation_prompts(self, case_id: str) -> list:
+        """
+        Select a structured set of prompts for validation:
+        1 global + up to 3 regional (different regions) + up to 2 lesion (different groups).
+
+        Returns list of prompt entries (max 6).
+        """
+        prompts = self.prompts_data.get(case_id, [])
+        if not prompts:
+            return []
+
+        by_type = {'global': [], 'region': [], 'lesion': []}
+        for p in prompts:
+            pt = p.get('prompt_type', 'global')
+            if pt in by_type:
+                by_type[pt].append(p)
+
+        selected = []
+
+        # 1 global
+        if by_type['global']:
+            selected.append(by_type['global'][np.random.randint(len(by_type['global']))])
+
+        # Up to 3 regional — one per unique region (keyed by lesion_numbers)
+        if by_type['region']:
+            groups = {}
+            for p in by_type['region']:
+                key = tuple(sorted(p.get('lesion_numbers', [])))
+                groups.setdefault(key, []).append(p)
+            keys = list(groups.keys())
+            np.random.shuffle(keys)
+            for key in keys[:3]:
+                g = groups[key]
+                selected.append(g[np.random.randint(len(g))])
+
+        # Up to 2 lesion — one per unique lesion group
+        if by_type['lesion']:
+            groups = {}
+            for p in by_type['lesion']:
+                key = tuple(sorted(p.get('lesion_numbers', [])))
+                groups.setdefault(key, []).append(p)
+            keys = list(groups.keys())
+            np.random.shuffle(keys)
+            for key in keys[:2]:
+                g = groups[key]
+                selected.append(g[np.random.randint(len(g))])
+
+        return selected
+
+    def _build_text_prompted_batch(
+        self,
+        subject,
+        label_data: torch.Tensor,
+        case_id: str,
+        prompt_entry: Optional[dict] = None,
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        """
+        Build a batch dict for text-prompted mode.
+
+        If prompt_entry is None, selects a random prompt (training).
+        If provided, uses that prompt directly (validation).
+
+        Args:
+            subject: TorchIO Subject with 'image' and optionally 'seg_cc'.
+            label_data: (C, H, W, D) label tensor (standard multi-class or cc labels).
+            case_id: Case identifier.
+            prompt_entry: Pre-selected prompt dict (optional, for validation).
+
+        Returns:
+            Batch dict with 'image', 'label' (binary), 'text_embedding', 'case_id',
+            or None if no valid prompt exists for this case.
+        """
+        if prompt_entry is None:
+            prompts = self.prompts_data.get(case_id, [])
+            if not prompts:
+                return None
+            prompt_entry = prompts[np.random.randint(len(prompts))]
+
+        prompt_text = prompt_entry['prompt']
+        lesion_numbers = prompt_entry.get('lesion_numbers', None)
+        label_value = prompt_entry.get('label_value', None)
+
+        # Look up precomputed embedding
+        embedding = self.precomputed_embeddings.get(prompt_text, None)
+        if embedding is None:
+            return None
+
+        # Extract binary mask
+        if 'seg_cc' in subject:
+            # Instance labels available: extract mask for specific lesion(s)
+            cc_data = subject['seg_cc'].data.long()
+            if lesion_numbers is not None:
+                binary_mask = torch.zeros_like(cc_data[0:1], dtype=torch.bool)
+                # Filter to CC labels that actually exist in the preprocessed
+                # volume — tiny components (1-few voxels) can vanish during
+                # nearest-neighbor resampling to isotropic spacing
+                available_labels = set(cc_data.unique().tolist())
+                for ln in lesion_numbers:
+                    if ln in available_labels:
+                        binary_mask = binary_mask | (cc_data[0:1] == ln)
+                binary_mask = binary_mask.float()
+            elif label_value is not None:
+                binary_mask = (cc_data == label_value).float()
+            else:
+                # Fallback: use all foreground
+                binary_mask = (label_data > 0).float()
+        else:
+            # No instance labels, use standard label
+            if label_value is not None:
+                binary_mask = (label_data == label_value).float()
+            else:
+                binary_mask = (label_data > 0).float()
+
+        # Shape: (1, H, W, D) -> (N=1, H, W, D) for consistency with model output
+        if binary_mask.dim() == 4:
+            binary_mask = binary_mask[0:1]  # Keep first channel only
+
+        return {
+            'image': subject['image'].data,
+            'label': binary_mask,  # (1, H, W, D) binary mask
+            'text_embedding': embedding,  # (embedding_dim,) tensor
+            'case_id': case_id,
+        }
+
     def __len__(self) -> int:
         """
         Return the 'virtual' size of the dataset.
@@ -301,6 +445,8 @@ class PatchDataset(IterableDataset):
         bars and learning rate schedulers. The actual number of samples yielded
         depends on the iteration logic.
         """
+        if self._val_tp_total_prompts is not None:
+            return self._val_tp_total_prompts
         return len(self.case_ids) * self.patches_per_volume
     
     def set_epoch(self, epoch: int) -> None:
@@ -400,7 +546,7 @@ class PatchDataset(IterableDataset):
             shuffled_case_ids = list(worker_case_ids)
 
         current_case = shuffled_case_ids[0]
-        image, label, affine, foreground_coords, valid_coords, weight_map = self._load_volume(current_case)
+        image, label, affine, foreground_coords, valid_coords, weight_map, seg_cc = self._load_volume(current_case)
         
         # Iterate over volumes
         for i, case_id in enumerate(shuffled_case_ids):
@@ -420,6 +566,10 @@ class PatchDataset(IterableDataset):
             # Add weight map as ScalarImage so it gets spatial transforms
             if weight_map is not None:
                 subject_dict['weight_map'] = tio.ScalarImage(tensor=weight_map, affine=affine)
+
+            # Add connected component labels for text-prompted mode
+            if seg_cc is not None:
+                subject_dict['seg_cc'] = tio.LabelMap(tensor=seg_cc, affine=affine)
 
             if not self.is_training:
                 case_hash = int(hash(case_id) % 1e8) 
@@ -441,63 +591,103 @@ class PatchDataset(IterableDataset):
             else:
                 patches_per_volume = self.patches_per_volume
 
-            # Extract multiple patches from this volume
-            for patch_idx in range(patches_per_volume):
-                # Training: Apply oversized crop, then transforms, then final crop
-                # Validation: Apply transforms (if any), then final crop
-                if self.is_training and self.oversized_crop is not None:
-                    subject = self.oversized_crop(base_subject)
-                else:
-                    subject = base_subject
-                
-                if self.transforms is not None and len(self.transforms.transforms) > 0:
-                    subject = self.transforms(subject)
+            # Validation text-prompted: select prompts first, then crop toward
+            # each prompt's specific lesions so the patch always contains them.
+            if not self.is_training and self.text_prompted and case_id in self.prompts_data:
+                val_prompts = self._select_validation_prompts(case_id)
+                original_fg_coords = base_subject.get('foreground_coords', None)
 
-                # Apply final crop to target patch size
-                subject = self.final_crop(subject)
+                for prompt_entry in val_prompts:
+                    # Compute prompt-specific foreground coords from full-volume seg_cc
+                    lesion_numbers = prompt_entry.get('lesion_numbers', None)
+                    if lesion_numbers and 'seg_cc' in base_subject:
+                        cc_full = base_subject['seg_cc'].data.long()[0]  # (H, W, D)
+                        prompt_fg = torch.zeros_like(cc_full, dtype=torch.bool)
+                        for ln in lesion_numbers:
+                            prompt_fg = prompt_fg | (cc_full == ln)
+                        coords = torch.nonzero(prompt_fg, as_tuple=False).numpy()
+                        if len(coords) > 0:
+                            base_subject['foreground_coords'] = coords
 
-                # Ensure label is long type
-                label_data = subject['label'].data.long()
+                    subject = self.final_crop(base_subject)
+                    label_data = subject['label'].data.long()
 
-                # Compute valid bounds from label (where label != -1)
-                # This is much faster than computing from full mask tensor in loss
-                if self.compute_valid_bounds:
-                    valid_bounds = self._compute_valid_bounds(label_data)
-                else:
-                    valid_bounds = None
+                    batch = self._build_text_prompted_batch(
+                        subject, label_data, case_id, prompt_entry
+                    )
+                    if batch is not None:
+                        yield batch
 
-                # Optional: print ratio of foreground voxels in the label (if verbose)
-                if self.verbose:
-                    foreground_ratio = (label_data > 0).float().mean().item()
-                    print(f"Foreground voxel ratio: {foreground_ratio:.4f} for patch {patch_idx} of case {case_id}", flush=True)
+                # Restore original foreground coords for safety
+                if original_fg_coords is not None:
+                    base_subject['foreground_coords'] = original_fg_coords
+            else:
+                # Training path (all modes) and validation non-text-prompted
+                for patch_idx in range(patches_per_volume):
+                    # Training: Apply oversized crop, then transforms, then final crop
+                    # Validation: Apply transforms (if any), then final crop
+                    if self.is_training and self.oversized_crop is not None:
+                        subject = self.oversized_crop(base_subject)
+                    else:
+                        subject = base_subject
 
-                # Yield the patch
-                batch = {
-                    'image': subject['image'].data,
-                    'label': label_data,
-                    'case_id': case_id,
-                }
-                
-                # Include weight map if available
-                if 'weight_map' in subject:
-                    batch['weight_map'] = subject['weight_map'].data
-                
-                # Only include valid_bounds if computed (to avoid collation issues with None)
-                if self.compute_valid_bounds:
-                    batch['valid_bounds'] = valid_bounds
-                
-                yield batch
+                    if self.transforms is not None and len(self.transforms.transforms) > 0:
+                        subject = self.transforms(subject)
+
+                    # Apply final crop to target patch size
+                    subject = self.final_crop(subject)
+
+                    # Ensure label is long type
+                    label_data = subject['label'].data.long()
+
+                    # Compute valid bounds from label (where label != -1)
+                    # This is much faster than computing from full mask tensor in loss
+                    if self.compute_valid_bounds:
+                        valid_bounds = self._compute_valid_bounds(label_data)
+                    else:
+                        valid_bounds = None
+
+                    # Optional: print ratio of foreground voxels in the label (if verbose)
+                    if self.verbose:
+                        foreground_ratio = (label_data > 0).float().mean().item()
+                        print(f"Foreground voxel ratio: {foreground_ratio:.4f} for patch {patch_idx} of case {case_id}", flush=True)
+
+                    # Yield the patch
+                    if self.text_prompted and case_id in self.prompts_data:
+                        # Text-prompted mode: select prompt, extract binary mask, look up embedding
+                        batch = self._build_text_prompted_batch(
+                            subject, label_data, case_id
+                        )
+                        if batch is not None:
+                            yield batch
+                    else:
+                        batch = {
+                            'image': subject['image'].data,
+                            'label': label_data,
+                            'case_id': case_id,
+                        }
+
+                        # Include weight map if available
+                        if 'weight_map' in subject:
+                            batch['weight_map'] = subject['weight_map'].data
+
+                        # Only include valid_bounds if computed (to avoid collation issues with None)
+                        if self.compute_valid_bounds:
+                            batch['valid_bounds'] = valid_bounds
+
+                        yield batch
 
             # Wait for the next volume to finish loading (if prefetch was started)
             if next_case_id:
-                image, label, affine, foreground_coords, valid_coords, weight_map = future.result()
+                image, label, affine, foreground_coords, valid_coords, weight_map, seg_cc = future.result()
     
-    def _load_volume(self, case_id: str) -> Tuple[torch.Tensor, torch.Tensor, np.ndarray, Optional[np.ndarray], Optional[np.ndarray], Optional[torch.Tensor]]:
+    def _load_volume(self, case_id: str):
         """
         Load volume and coordinate arrays.
-        
+
         Returns:
-            Tuple of (image, label, affine, foreground_coords, valid_coords, weight_map)
+            Tuple of (image, label, affine, foreground_coords, valid_coords, weight_map, seg_cc)
+            seg_cc is None unless text_prompted mode and 'seg_cc' key exists in data.
         """
         # Check cache first
         if self._volume_cache is not None and case_id in self._volume_cache:
@@ -507,6 +697,7 @@ class PatchDataset(IterableDataset):
         foreground_coords = None
         valid_coords = None
         weight_map = None
+        seg_cc = None
         
         if self.use_preprocessed:
             # Load preprocessed numpy arrays (.npy or .npz)
@@ -518,10 +709,16 @@ class PatchDataset(IterableDataset):
                     raise FileNotFoundError(f"Missing compressed file for case {case_id}: {data_file}")
                 
                 data = np.load(data_file)
-                
+
                 image = torch.from_numpy(data['data']).float()
                 label = torch.from_numpy(data['seg']).long()
-                
+
+                # Load instance labels (connected components) for text-prompted mode
+                if self.text_prompted and 'seg_cc' in data:
+                    seg_cc = torch.from_numpy(data['seg_cc']).long()
+                else:
+                    seg_cc = None
+
                 # Load weight map if available
                 if weight_map_file.exists():
                     weight_data = np.load(weight_map_file)
@@ -547,9 +744,9 @@ class PatchDataset(IterableDataset):
         
         # Cache if enabled
         if self._volume_cache is not None:
-            self._volume_cache[case_id] = (image, label, affine, foreground_coords, valid_coords, weight_map)
-        
-        return image, label, affine, foreground_coords, valid_coords, weight_map
+            self._volume_cache[case_id] = (image, label, affine, foreground_coords, valid_coords, weight_map, seg_cc)
+
+        return image, label, affine, foreground_coords, valid_coords, weight_map, seg_cc
 
 
 def create_data_loaders(
@@ -559,7 +756,9 @@ def create_data_loaders(
     transforms_train=None,
     transforms_val=None,
     use_preprocessed: bool = False,
-    train_on_all: bool = False
+    train_on_all: bool = False,
+    precomputed_embeddings: Optional[Dict[str, 'torch.Tensor']] = None,
+    prompts_data: Optional[Dict[str, list]] = None,
 ) -> Tuple[DataLoader, Optional[DataLoader]]:
     """
     Create native PyTorch data loaders using IterableDataset.
@@ -645,6 +844,9 @@ def create_data_loaders(
         train_transforms_full = transforms_train
         val_transforms_full = transforms_val
     
+    # Text-prompted mode detection
+    text_prompted = hasattr(config, 'text_prompted') and config.text_prompted.enabled
+
     # Create training dataset (IterableDataset with multiple patches per volume)
     # Transforms handle: resampling, normalization, oversized cropping, augmentation
     # Final center crop to patch_size is done in the dataset after transforms
@@ -663,7 +865,10 @@ def create_data_loaders(
         oversize_factor=1.25,
         foreground_oversample_percent=config.training.oversample_foreground_percent,
         verbose=False,
-        compute_valid_bounds=getattr(config.training, 'betti_weight', 0.0) > 0
+        compute_valid_bounds=getattr(config.training, 'betti_weight', 0.0) > 0,
+        text_prompted=text_prompted,
+        precomputed_embeddings=precomputed_embeddings,
+        prompts_data=prompts_data,
     )
     
     # Create data loaders
@@ -698,7 +903,10 @@ def create_data_loaders(
             seed=getattr(config, 'seed', None),
             foreground_oversample_percent=1.0,  # High foreground bias for validation
             verbose=False,
-            compute_valid_bounds=getattr(config.training, 'betti_weight', 0.0) > 0
+            compute_valid_bounds=getattr(config.training, 'betti_weight', 0.0) > 0,
+            text_prompted=text_prompted,
+            precomputed_embeddings=precomputed_embeddings,
+            prompts_data=prompts_data,
         )
 
         val_loader = DataLoader(

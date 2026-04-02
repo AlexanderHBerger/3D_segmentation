@@ -105,7 +105,8 @@ class DiceLoss(nn.Module):
         plus_plus: bool = False,
         gamma: float = 2.0,
         tversky_beta: float = 0.5,
-        cldice_alpha: float = 0.0
+        cldice_alpha: float = 0.0,
+        binary: bool = False,
     ):
         super().__init__()
         self.smooth = smooth
@@ -117,6 +118,7 @@ class DiceLoss(nn.Module):
         self.gamma = gamma
         self.tversky_beta = tversky_beta
         self.cldice_alpha = cldice_alpha
+        self.binary = binary
         
         # Initialize skeletonizer if clDice is enabled
         if self.cldice_alpha > 0:
@@ -134,11 +136,25 @@ class DiceLoss(nn.Module):
         """
         Args:
             predictions: (B, C, H, W, D) - logits
-            targets: (B, H, W, D) - class indices
+            targets: (B, H, W, D) class indices OR (B, N, H, W, D) binary masks when binary=True
         """
+        if self.binary:
+            # Binary mode: predictions (B, N, H, W, D), targets (B, N, H, W, D)
+            probs = torch.sigmoid(predictions)
+            # Flatten spatial dims for Dice
+            p_flat = probs.reshape(probs.shape[0], probs.shape[1], -1)
+            t_flat = targets.float().reshape(targets.shape[0], targets.shape[1], -1)
+
+            tp = (p_flat * t_flat).sum(dim=-1)
+            fp = (p_flat * (1.0 - t_flat)).sum(dim=-1)
+            fn = ((1.0 - p_flat) * t_flat).sum(dim=-1)
+            dice_score = (2.0 * tp + self.smooth) / (2.0 * tp + fp + fn + self.smooth)
+            dice_loss = 1.0 - dice_score.mean()
+            return dice_loss, {'dice': dice_loss}
+
         # Create mask for valid pixels
         valid_mask = targets != self.ignore_index
-        
+
         # Compute probabilities with selected softmax variant
         num_classes = predictions.shape[1]
         targets_clamped = torch.clamp(targets, 0, num_classes - 1)
@@ -146,7 +162,7 @@ class DiceLoss(nn.Module):
         # Convert targets to one-hot for Dice calculation
         targets_one_hot = torch.zeros_like(predictions)
         targets_one_hot.scatter_(1, targets_clamped.unsqueeze(1).long(), 1.0)
-        
+
         if self.use_fixed_grad_softmax:
             # Apply FixedGradSoftmax (requires one-hot targets)
             # When plus_plus=True, use Dice++ specific gradient correction
@@ -156,12 +172,12 @@ class DiceLoss(nn.Module):
         else:
             # Standard softmax
             probs = F.softmax(predictions, dim=1)
-        
+
         # Apply valid mask to both predictions and targets
         valid_mask_expanded = valid_mask.unsqueeze(1).expand_as(probs)
         probs = probs * valid_mask_expanded
         targets_one_hot = targets_one_hot * valid_mask_expanded
-        
+
         # Vectorized Dice calculation
         start_idx = 0 if self.include_background else 1
         pred_subset = probs[:, start_idx:]
@@ -214,8 +230,13 @@ class DiceLoss(nn.Module):
 
 
 class CombinedLoss(nn.Module):
-    """Combined Dice (or Dice++/Tversky) + CrossEntropy Loss with optional clDice and weight maps"""
-    
+    """Combined Dice (or Dice++/Tversky) + CrossEntropy Loss with optional clDice and weight maps.
+
+    When binary=True, operates on per-channel binary masks using sigmoid + BCE
+    instead of softmax + CE. Used for text-prompted segmentation where predictions
+    and targets are both (B, N, H, W, D).
+    """
+
     def __init__(
         self,
         dice_weight: float = 1.0,
@@ -232,6 +253,7 @@ class CombinedLoss(nn.Module):
         use_weight_map: bool = False,
         weight_map_scale: float = 1.0,
         weight_map_bias: float = 1.0,
+        binary: bool = False,
     ):
         super().__init__()
         self.dice_weight = dice_weight
@@ -240,8 +262,10 @@ class CombinedLoss(nn.Module):
         self.use_weight_map = use_weight_map
         self.weight_map_scale = weight_map_scale
         self.weight_map_bias = weight_map_bias
-        # Use reduction='none' when using weight maps to apply per-pixel weighting
-        self.ce_loss = nn.CrossEntropyLoss(ignore_index=ignore_index, reduction='none' if use_weight_map else 'mean')
+        self.binary = binary
+        if not binary:
+            # Use reduction='none' when using weight maps to apply per-pixel weighting
+            self.ce_loss = nn.CrossEntropyLoss(ignore_index=ignore_index, reduction='none' if use_weight_map else 'mean')
         self.dice_loss = DiceLoss(
             smooth=smooth,
             include_background=include_background,
@@ -252,47 +276,53 @@ class CombinedLoss(nn.Module):
             gamma=gamma,
             tversky_beta=tversky_beta,
             cldice_alpha=cldice_alpha,
+            binary=binary,
         )
 
     def forward(self, predictions: torch.Tensor, targets: torch.Tensor, weight_map: Optional[torch.Tensor] = None, **kwargs):
         """
         Args:
-            predictions: (B, C, H, W, D) - logits
-            targets: (B, H, W, D) - class indices
+            predictions: (B, C, H, W, D) logits
+            targets: (B, H, W, D) class indices OR (B, N, H, W, D) binary masks when binary=True
             weight_map: (B, 1, H, W, D) or (B, H, W, D) - per-pixel weights for CE loss (optional)
             **kwargs: Additional arguments (e.g., valid_bounds) passed to subclasses
-        
+
         Returns:
             Tuple of (loss, components_dict) where components_dict contains scaled loss components
         """
         components = {}
         total_loss = 0.0
-        
-        # Only compute CE loss if it has non-zero weight
+
+        # Only compute CE/BCE loss if it has non-zero weight
         if self.ce_weight > 0:
-            ce_per_pixel = self.ce_loss(predictions, targets.long())
-            
-            if self.use_weight_map and weight_map is not None:
-                # Apply per-pixel weighting
-                # weight_map shape: (B, 1, H, W, D) or (B, H, W, D)
-                # ce_per_pixel shape: (B, H, W, D)
-                if weight_map.dim() == 5 and weight_map.size(1) == 1:
-                    weight_map = weight_map.squeeze(1)
-                
-                # Mask for valid pixels (not ignored)
-                valid_mask = (targets != self.ignore_index).float()
-                
-                # Apply weights and compute mean over valid pixels
-                weighted_ce = ce_per_pixel * (weight_map * self.weight_map_scale + self.weight_map_bias)
-                ce = (weighted_ce * valid_mask).sum() / (valid_mask.sum() + 1e-8)
+            if self.binary:
+                ce = F.binary_cross_entropy_with_logits(
+                    predictions, targets.float(), reduction='mean'
+                )
             else:
-                # Without weight map, ce_per_pixel is already reduced to scalar
-                ce = ce_per_pixel if ce_per_pixel.dim() == 0 else ce_per_pixel.mean()
-            
+                ce_per_pixel = self.ce_loss(predictions, targets.long())
+
+                if self.use_weight_map and weight_map is not None:
+                    # Apply per-pixel weighting
+                    # weight_map shape: (B, 1, H, W, D) or (B, H, W, D)
+                    # ce_per_pixel shape: (B, H, W, D)
+                    if weight_map.dim() == 5 and weight_map.size(1) == 1:
+                        weight_map = weight_map.squeeze(1)
+
+                    # Mask for valid pixels (not ignored)
+                    valid_mask = (targets != self.ignore_index).float()
+
+                    # Apply weights and compute mean over valid pixels
+                    weighted_ce = ce_per_pixel * (weight_map * self.weight_map_scale + self.weight_map_bias)
+                    ce = (weighted_ce * valid_mask).sum() / (valid_mask.sum() + 1e-8)
+                else:
+                    # Without weight map, ce_per_pixel is already reduced to scalar
+                    ce = ce_per_pixel if ce_per_pixel.dim() == 0 else ce_per_pixel.mean()
+
             scaled_ce = self.ce_weight * ce
             components['ce'] = scaled_ce
             total_loss = total_loss + scaled_ce
-        
+
         # Only compute Dice loss if it has non-zero weight
         if self.dice_weight > 0:
             dice, dice_components = self.dice_loss(predictions, targets)
@@ -512,29 +542,39 @@ class DeepSupervisionLoss(nn.Module):
         """
         Args:
             predictions: List of predictions at different scales [(B, C, H, W, D), ...]
-            targets: (B, H, W, D) - class indices
+            targets: (B, H, W, D) class indices OR (B, N, H, W, D) binary masks
             weight_map: (B, 1, H, W, D) or (B, H, W, D) - per-pixel weights for CE loss (optional)
             **kwargs: Additional arguments (e.g., valid_bounds) passed to loss_fn
-        
+
         Returns:
             Tuple of (loss, components_dict) where components_dict contains aggregated scaled loss components
         """
         total_loss = 0.0
         aggregated_components = {}
-        
+        binary_targets = targets.dim() == 5
+
         for i, (pred, weight) in enumerate(zip(predictions, self.weights)):
             if weight == 0:
                 continue
-            
+
             # Downsample targets if needed
             if i < len(self.downsampling_scales) and self.downsampling_scales[i] > 1:
                 scale = self.downsampling_scales[i]
-                target_scaled = F.interpolate(
-                    targets.unsqueeze(1).float(),
-                    scale_factor=1.0/scale,
-                    mode='nearest'
-                ).squeeze(1).long()
-                
+                if binary_targets:
+                    # Binary targets (B, N, H, W, D): interpolate directly, keep float
+                    target_scaled = F.interpolate(
+                        targets.float(),
+                        scale_factor=1.0/scale,
+                        mode='nearest'
+                    )
+                else:
+                    # Class index targets (B, H, W, D): add/remove channel dim
+                    target_scaled = F.interpolate(
+                        targets.unsqueeze(1).float(),
+                        scale_factor=1.0/scale,
+                        mode='nearest'
+                    ).squeeze(1).long()
+
                 # Downsample weight_map if provided
                 if weight_map is not None:
                     wm = weight_map if weight_map.dim() == 5 else weight_map.unsqueeze(1)
@@ -549,12 +589,14 @@ class DeepSupervisionLoss(nn.Module):
             else:
                 target_scaled = targets
                 weight_map_scaled = weight_map
-            
+
             # Resize prediction to match target if needed
-            if pred.shape[2:] != target_scaled.shape[1:]:
+            # For binary targets spatial dims start at index 2, for class indices at index 1
+            target_spatial = target_scaled.shape[2:] if binary_targets else target_scaled.shape[1:]
+            if pred.shape[2:] != target_spatial:
                 pred_resized = F.interpolate(
                     pred,
-                    size=target_scaled.shape[1:],
+                    size=target_spatial,
                     mode='trilinear',
                     align_corners=False
                 )
@@ -581,6 +623,14 @@ class DeepSupervisionLoss(nn.Module):
 
 def get_loss_function(config) -> nn.Module:
     """Get loss function based on configuration"""
+    # Text-prompted mode uses binary CombinedLoss (sigmoid + BCE instead of softmax + CE)
+    if hasattr(config, 'text_prompted') and config.text_prompted.enabled:
+        return CombinedLoss(
+            dice_weight=config.training.dice_weight,
+            ce_weight=config.training.ce_weight,
+            binary=True,
+        )
+
     ignore_index = getattr(config.training, 'ignore_index', -1)
     use_fixed_grad_softmax = getattr(config.training, 'use_fixed_grad_softmax', False)
     exponential_correction = getattr(config.training, 'exponential_correction', None)

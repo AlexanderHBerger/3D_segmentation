@@ -38,8 +38,11 @@ def prepare_targets_with_mask(
     # Create mask for valid voxels (not ignore_index)
     valid_mask = targets != ignore_index
     
-    # Clamp targets to valid range [0, num_classes) for safety
-    targets_clamped = torch.clamp(targets, 0, num_classes - 1)
+    # Clamp targets to valid range for safety.
+    # For binary mode (num_classes=1), targets are still {0, 1} class indices
+    # (1 output channel with sigmoid, not 1 class), so clamp to [0, 1].
+    clamp_max = max(num_classes, 2) - 1
+    targets_clamped = torch.clamp(targets, 0, clamp_max).long()
     
     # Count valid voxels
     num_valid_voxels = valid_mask.sum()
@@ -93,11 +96,15 @@ def dice_coefficient(
     
     # Extract number of classes and convert predictions to probabilities
     num_classes = predictions.shape[1]
-    probs = F.softmax(predictions, dim=1)
-    
-    # Convert targets to one-hot: (B, H, W, D) -> (B, C, H, W, D)
-    targets_one_hot = F.one_hot(targets_clamped.long(), num_classes=num_classes)
-    targets_one_hot = targets_one_hot.permute(0, 4, 1, 2, 3).float()
+    if num_classes == 1:
+        # Binary sigmoid mode (e.g., text-prompted segmentation)
+        probs = torch.sigmoid(predictions)  # (B, 1, H, W, D)
+        targets_one_hot = targets_clamped.unsqueeze(1).float()  # (B, 1, H, W, D)
+    else:
+        probs = F.softmax(predictions, dim=1)
+        # Convert targets to one-hot: (B, H, W, D) -> (B, C, H, W, D)
+        targets_one_hot = F.one_hot(targets_clamped.long(), num_classes=num_classes)
+        targets_one_hot = targets_one_hot.permute(0, 4, 1, 2, 3).float()
     
     # Apply valid mask
     valid_mask_expanded = valid_mask.unsqueeze(1).expand_as(probs)
@@ -115,9 +122,13 @@ def dice_coefficient(
     dice_scores = (2.0 * intersection + smooth) / (union + smooth)  # (B, C)
     
     # Select classes (exclude background if needed)
-    start_idx = 0 if include_background else 1
+    # For binary mode (num_classes=1), the single channel IS foreground — always include it
+    if num_classes == 1:
+        start_idx = 0
+    else:
+        start_idx = 0 if include_background else 1
     dice_scores = dice_scores[:, start_idx:]  # (B, C_subset)
-    
+
     # Return mean over batch
     return dice_scores.mean(dim=0)
 
@@ -143,8 +154,8 @@ def hard_dice_coefficient(
     Returns:
         Dice coefficient per class (averaged over batch)
     """
-    num_classes = targets_clamped.max().item() + 1
-    
+    num_classes = max(targets_clamped.max().item() + 1, pred_indices.max().item() + 1, 2)
+
     # Convert to one-hot
     pred_one_hot = F.one_hot(pred_indices, num_classes=num_classes).permute(0, 4, 1, 2, 3).float()
     targets_one_hot = F.one_hot(targets_clamped.long(), num_classes=num_classes).permute(0, 4, 1, 2, 3).float()
@@ -175,11 +186,12 @@ def hard_dice_coefficient(
 class MetricsCalculator:
     """Class to calculate and accumulate metrics during training/validation."""
 
-    def __init__(self, num_classes: int = 2, include_background: bool = False, ignore_index: int = -1, compute_calibration: bool = False, num_bins: int = 15):
+    def __init__(self, num_classes: int = 2, include_background: bool = False, ignore_index: int = -1, compute_calibration: bool = False, compute_topological: bool = True, num_bins: int = 15):
         self.num_classes = num_classes
         self.include_background = include_background
         self.ignore_index = ignore_index
         self.compute_calibration = compute_calibration
+        self.compute_topological = compute_topological
         self.num_bins = num_bins
         self.reset()
 
@@ -220,7 +232,10 @@ class MetricsCalculator:
         )
 
         # calculate argmax predictions
-        argmax_preds = predictions.argmax(dim=1)
+        if num_classes == 1:
+            argmax_preds = (torch.sigmoid(predictions[:, 0]) > 0.5).long()
+        else:
+            argmax_preds = predictions.argmax(dim=1)
 
         # Calculate dice metric (pass mask info)
         dice = dice_coefficient(
@@ -245,12 +260,13 @@ class MetricsCalculator:
             'dice_hard': hard_dice.mean().item()
         }
 
-        # Betti number metrics (cheap)
-        topological_errors = compute_topological_errors(
-            targets_clamped, argmax_preds, valid_mask
-        )
-        self.topo_metrics.append(topological_errors)
-        batch_metrics.update(topological_errors)
+        # Betti number metrics
+        if self.compute_topological:
+            topological_errors = compute_topological_errors(
+                targets_clamped, argmax_preds, valid_mask
+            )
+            self.topo_metrics.append(topological_errors)
+            batch_metrics.update(topological_errors)
 
         # Calculate calibration metrics if enabled (pass mask info)
         if self.compute_calibration:

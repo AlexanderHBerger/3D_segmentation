@@ -22,3 +22,8 @@ pandas>=2.0.0
 
 # nnUNet model architectures
 dynamic-network-architectures>=0.2
+
+# Text-prompted segmentation (VoxTell-style)
+einops  # Tensor reshaping for transformer fusion
+positional-encodings[torch]  # 3D positional encoding for transformer
+transformers>=4.54.0  # Text encoder (Qwen3-Embedding-4B), only needed for inference/precomputation
