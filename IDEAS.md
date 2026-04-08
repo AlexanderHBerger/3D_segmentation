@@ -76,6 +76,34 @@ Dataset018 has 3,116 training cases from 3 sources (BRATS, Stanford, NYU). More 
 
 ---
 
+## Loss Functions & Training
+
+### Distance-field-based loss penalizing anatomically distant false positives
+
+**Status:** Idea — needs prototyping  
+**Priority:** Medium  
+**Relates to:** Atlas quality (tolerates fuzzy region boundaries), spatial modifiers (complementary spatial awareness)
+
+Currently, all false positive voxels are penalized equally regardless of how far they are from the target region. A distance-field loss would penalize segmentations in distant regions more heavily than those in neighboring regions — e.g., predicting a lesion in the occipital lobe when the prompt says "frontal" should cost more than bleeding into an adjacent gyrus.
+
+**Why this is appealing:**
+- Gracefully handles fuzzy atlas boundaries — slight region misassignment near borders produces low penalty, gross errors produce high penalty. No need for perfect atlas precision.
+- Gives the model a soft spatial prior from the prompt's location, rather than the binary "right region / wrong region" signal it currently gets.
+- Complements the existing fuzzy ±1 size matching philosophy: be strict about large errors, tolerant of small ones.
+
+**What's needed:**
+- Precompute distance fields from each atlas region (or the target lesion's region) during preprocessing. Store alongside the atlas labels.
+- Design the loss term: weight BCE/Dice voxel-wise by distance from target region. Needs a scaling function (linear? exponential decay?) and a hyperparameter for how aggressively to penalize distance.
+- Integrate as an additive loss term in `TextPromptedLoss`, controlled by a weight in config.
+
+**Open questions:**
+- Euclidean vs. geodesic distance? Euclidean is trivial to compute but anatomically misleading across the falx/tentorium (regions on opposite sides of a membrane are spatially close but anatomically distant). Geodesic is more correct but expensive.
+- Only applies to region-level and lesion-level prompts — global prompts have no target region. Need to handle this gracefully (zero out the distance loss for global prompts).
+- How to normalize the distance field across different brain sizes / crop regions?
+- Interaction with deep supervision: apply at all resolution levels or only full-res?
+
+---
+
 ## Benchmarking & Publication
 
 ### Compare against Brain Mets Challenge leaderboard
