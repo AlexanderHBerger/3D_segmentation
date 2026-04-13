@@ -105,6 +105,11 @@ class TrainingConfig:
     lora_alpha: float = 32.0             # LoRA scaling factor (alpha/rank is the effective scale)
     lora_dropout: float = 0.0            # Dropout on LoRA adapter layers
 
+    # Numerical stability / regularization
+    logit_clamp: float = 0.0             # Clamp model output logits to [-val, val] before loss; 0=disabled
+    spectral_norm: bool = False          # Apply spectral normalization to projection layers
+    initial_grad_scale: float = 65536.0  # Initial GradScaler scale factor
+
     # Foreground oversampling (nnUNet uses 0.33)
     oversample_foreground_percent: float = 0.33  # Always sample foreground patches
     
@@ -239,6 +244,10 @@ class TextPromptedConfig:
     instance_labels_suffix: str = "_cc"  # Suffix for connected component instance labels
     atlas_labels_suffix: str = "_atlas"  # Suffix for atlas region labels
     max_prompts_per_sample: int = 1  # Number of text prompts per training sample
+
+    # Distance field auxiliary loss (spatial prior from atlas regions)
+    distance_field_weight: float = 0.0   # Weight for distance-based spatial penalty; 0=disabled
+    distance_field_sigma: float = 20.0   # Controls sigmoid falloff (voxels): 0 inside region, ~1 far away
 
 
 @dataclass

@@ -254,6 +254,7 @@ class CombinedLoss(nn.Module):
         weight_map_scale: float = 1.0,
         weight_map_bias: float = 1.0,
         binary: bool = False,
+        distance_field_weight: float = 0.0,
     ):
         super().__init__()
         self.dice_weight = dice_weight
@@ -263,6 +264,7 @@ class CombinedLoss(nn.Module):
         self.weight_map_scale = weight_map_scale
         self.weight_map_bias = weight_map_bias
         self.binary = binary
+        self.distance_field_weight = distance_field_weight
         if not binary:
             # Use reduction='none' when using weight maps to apply per-pixel weighting
             self.ce_loss = nn.CrossEntropyLoss(ignore_index=ignore_index, reduction='none' if use_weight_map else 'mean')
@@ -296,9 +298,16 @@ class CombinedLoss(nn.Module):
         # Only compute CE/BCE loss if it has non-zero weight
         if self.ce_weight > 0:
             if self.binary:
-                ce = F.binary_cross_entropy_with_logits(
-                    predictions, targets.float(), reduction='mean'
-                )
+                distance_field = kwargs.get('distance_field', None)
+                if distance_field is not None and self.distance_field_weight > 0:
+                    pixel_weight = 1.0 + self.distance_field_weight * distance_field
+                    ce = F.binary_cross_entropy_with_logits(
+                        predictions, targets.float(), weight=pixel_weight, reduction='mean'
+                    )
+                else:
+                    ce = F.binary_cross_entropy_with_logits(
+                        predictions, targets.float(), reduction='mean'
+                    )
             else:
                 ce_per_pixel = self.ce_loss(predictions, targets.long())
 
@@ -629,6 +638,7 @@ def get_loss_function(config) -> nn.Module:
             dice_weight=config.training.dice_weight,
             ce_weight=config.training.ce_weight,
             binary=True,
+            distance_field_weight=getattr(config.text_prompted, 'distance_field_weight', 0.0),
         )
 
     ignore_index = getattr(config.training, 'ignore_index', -1)

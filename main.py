@@ -98,6 +98,20 @@ def main():
     parser.add_argument('--lora_rank', type=int, default=None,
                         help='LoRA rank (default: 16)')
 
+    # Regularization / numerical stability
+    parser.add_argument('--logit_clamp', type=float, default=None,
+                        help='Clamp output logits to [-val, val] before loss (0=disabled)')
+    parser.add_argument('--spectral_norm', action='store_true',
+                        help='Apply spectral normalization to projection layers')
+    parser.add_argument('--initial_grad_scale', type=float, default=None,
+                        help='Initial GradScaler scale factor (default: 65536)')
+
+    # Distance field auxiliary loss
+    parser.add_argument('--distance_field_weight', type=float, default=None,
+                        help='Weight for distance-based spatial penalty (0=disabled)')
+    parser.add_argument('--distance_field_sigma', type=float, default=None,
+                        help='Distance field sigmoid falloff in voxels (default: 20)')
+
     args = parser.parse_args()
     
     # Validate config loading
@@ -174,6 +188,20 @@ def main():
         config.training.lora_enabled = True
     if args.lora_rank is not None:
         config.training.lora_rank = args.lora_rank
+
+    # Regularization / numerical stability overrides
+    if args.logit_clamp is not None:
+        config.training.logit_clamp = args.logit_clamp
+    if args.spectral_norm:
+        config.training.spectral_norm = True
+    if args.initial_grad_scale is not None:
+        config.training.initial_grad_scale = args.initial_grad_scale
+
+    # Distance field auxiliary loss overrides
+    if args.distance_field_weight is not None:
+        config.text_prompted.distance_field_weight = args.distance_field_weight
+    if args.distance_field_sigma is not None:
+        config.text_prompted.distance_field_sigma = args.distance_field_sigma
 
     # train_on_all is always applied (even on resume — data split is not stored in checkpoint)
     if args.train_on_all:

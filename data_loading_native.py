@@ -191,6 +191,8 @@ class PatchDataset(IterableDataset):
         text_prompted: bool = False,
         precomputed_embeddings: Optional[Dict[str, 'torch.Tensor']] = None,
         prompts_data: Optional[Dict[str, list]] = None,
+        distance_field_weight: float = 0.0,
+        distance_field_sigma: float = 20.0,
     ):
         """
         Args:
@@ -263,6 +265,8 @@ class PatchDataset(IterableDataset):
         self.text_prompted = text_prompted
         self.precomputed_embeddings = precomputed_embeddings
         self.prompts_data = prompts_data
+        self.distance_field_weight = distance_field_weight
+        self.distance_field_sigma = distance_field_sigma
         if text_prompted:
             assert precomputed_embeddings is not None, "precomputed_embeddings required for text-prompted mode"
             assert prompts_data is not None, "prompts_data required for text-prompted mode"
@@ -360,6 +364,51 @@ class PatchDataset(IterableDataset):
 
         return selected
 
+    def _get_distance_field(self, subject, case_id: str, prompt_entry: dict):
+        """Compute distance field from the cropped atlas for the prompt's target region(s).
+
+        Computes EDT on-the-fly from the already-cropped seg_atlas in the subject.
+        This ensures the distance field always matches the patch spatial dimensions.
+
+        Returns a (1, H, W, D) float tensor or None.
+        """
+        if self.distance_field_weight <= 0:
+            return None
+        if prompt_entry.get('prompt_type') == 'global':
+            return None
+        if 'seg_atlas' not in subject or 'seg_cc' not in subject:
+            return None
+
+        atlas = subject['seg_atlas'].data.long()[0].numpy()
+        seg_cc = subject['seg_cc'].data.long()[0].numpy()
+        lesion_numbers = prompt_entry.get('lesion_numbers', [])
+
+        # Find atlas regions containing the target lesions
+        target_regions = set()
+        for ln in lesion_numbers:
+            mask = seg_cc == ln
+            if mask.any():
+                region_labels = atlas[mask]
+                region_labels = region_labels[region_labels > 0]
+                target_regions.update(region_labels.tolist())
+
+        if not target_regions:
+            return None
+
+        # Build region mask and compute EDT on the cropped patch
+        region_mask = np.isin(atlas, list(target_regions))
+        if region_mask.all() or not region_mask.any():
+            return None
+
+        from scipy.ndimage import distance_transform_edt
+        distance = distance_transform_edt(~region_mask).astype(np.float32)
+
+        # Normalize: sigmoid -> 0 inside region, ~1 far away
+        sigma = self.distance_field_sigma
+        normalized = 1.0 / (1.0 + np.exp(-(distance - 3 * sigma) / sigma))
+
+        return torch.from_numpy(normalized).unsqueeze(0).float()
+
     def _build_text_prompted_batch(
         self,
         subject,
@@ -428,12 +477,23 @@ class PatchDataset(IterableDataset):
         if binary_mask.dim() == 4:
             binary_mask = binary_mask[0:1]  # Keep first channel only
 
-        return {
+        # Compute distance field for spatial prior loss
+        distance_field = self._get_distance_field(subject, case_id, prompt_entry)
+
+        batch = {
             'image': subject['image'].data,
             'label': binary_mask,  # (1, H, W, D) binary mask
             'text_embedding': embedding,  # (embedding_dim,) tensor
             'case_id': case_id,
         }
+        if self.distance_field_weight > 0:
+            # Always include distance_field when enabled so collation works;
+            # zeros = no spatial penalty (e.g., global prompts or missing atlas)
+            if distance_field is not None:
+                batch['distance_field'] = distance_field
+            else:
+                batch['distance_field'] = torch.zeros_like(binary_mask)
+        return batch
 
     def __len__(self) -> int:
         """
@@ -546,7 +606,7 @@ class PatchDataset(IterableDataset):
             shuffled_case_ids = list(worker_case_ids)
 
         current_case = shuffled_case_ids[0]
-        image, label, affine, foreground_coords, valid_coords, weight_map, seg_cc = self._load_volume(current_case)
+        image, label, affine, foreground_coords, valid_coords, weight_map, seg_cc, seg_atlas = self._load_volume(current_case)
         
         # Iterate over volumes
         for i, case_id in enumerate(shuffled_case_ids):
@@ -570,6 +630,10 @@ class PatchDataset(IterableDataset):
             # Add connected component labels for text-prompted mode
             if seg_cc is not None:
                 subject_dict['seg_cc'] = tio.LabelMap(tensor=seg_cc, affine=affine)
+
+            # Add atlas labels for distance field loss
+            if seg_atlas is not None:
+                subject_dict['seg_atlas'] = tio.LabelMap(tensor=seg_atlas, affine=affine)
 
             if not self.is_training:
                 case_hash = int(hash(case_id) % 1e8) 
@@ -679,15 +743,15 @@ class PatchDataset(IterableDataset):
 
             # Wait for the next volume to finish loading (if prefetch was started)
             if next_case_id:
-                image, label, affine, foreground_coords, valid_coords, weight_map, seg_cc = future.result()
+                image, label, affine, foreground_coords, valid_coords, weight_map, seg_cc, seg_atlas = future.result()
     
     def _load_volume(self, case_id: str):
         """
         Load volume and coordinate arrays.
 
         Returns:
-            Tuple of (image, label, affine, foreground_coords, valid_coords, weight_map, seg_cc)
-            seg_cc is None unless text_prompted mode and 'seg_cc' key exists in data.
+            Tuple of (image, label, affine, foreground_coords, valid_coords, weight_map, seg_cc, seg_atlas)
+            seg_cc/seg_atlas are None unless text_prompted mode and the key exists in data.
         """
         # Check cache first
         if self._volume_cache is not None and case_id in self._volume_cache:
@@ -719,6 +783,12 @@ class PatchDataset(IterableDataset):
                 else:
                     seg_cc = None
 
+                # Load atlas labels for distance field loss
+                if self.text_prompted and 'seg_atlas' in data:
+                    seg_atlas = torch.from_numpy(data['seg_atlas']).long()
+                else:
+                    seg_atlas = None
+
                 # Load weight map if available
                 if weight_map_file.exists():
                     weight_data = np.load(weight_map_file)
@@ -744,9 +814,9 @@ class PatchDataset(IterableDataset):
         
         # Cache if enabled
         if self._volume_cache is not None:
-            self._volume_cache[case_id] = (image, label, affine, foreground_coords, valid_coords, weight_map, seg_cc)
+            self._volume_cache[case_id] = (image, label, affine, foreground_coords, valid_coords, weight_map, seg_cc, seg_atlas)
 
-        return image, label, affine, foreground_coords, valid_coords, weight_map, seg_cc
+        return image, label, affine, foreground_coords, valid_coords, weight_map, seg_cc, seg_atlas
 
 
 def create_data_loaders(
@@ -869,6 +939,8 @@ def create_data_loaders(
         text_prompted=text_prompted,
         precomputed_embeddings=precomputed_embeddings,
         prompts_data=prompts_data,
+        distance_field_weight=getattr(config.text_prompted, 'distance_field_weight', 0.0) if hasattr(config, 'text_prompted') else 0.0,
+        distance_field_sigma=getattr(config.text_prompted, 'distance_field_sigma', 20.0) if hasattr(config, 'text_prompted') else 20.0,
     )
     
     # Create data loaders
@@ -907,6 +979,7 @@ def create_data_loaders(
             text_prompted=text_prompted,
             precomputed_embeddings=precomputed_embeddings,
             prompts_data=prompts_data,
+            distance_field_weight=getattr(config.text_prompted, 'distance_field_weight', 0.0) if hasattr(config, 'text_prompted') else 0.0,
         )
 
         val_loader = DataLoader(

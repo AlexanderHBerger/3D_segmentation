@@ -1,6 +1,7 @@
 """
 Training script for MedNeXt segmentation model
 """
+import math
 import random
 import numpy as np
 import torch
@@ -49,7 +50,8 @@ class Trainer:
 
         # Load config (either from checkpoint or use provided config)
         self.config = self._load_config(config, checkpoint)
-        
+        self._nan_abort = False  # Set by train_epoch if 10 consecutive NaN
+
         # Set up device
         self.device = torch.device(self.config.device if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {self.device}")
@@ -58,7 +60,13 @@ class Trainer:
         self.set_random_seeds(self.config.seed + (0 if self.train_on_all else fold))
         
         # Initialize mixed precision
-        self.scaler = GradScaler('cuda' if self.device.type == 'cuda' else 'cpu') if self.config.mixed_precision else None
+        if self.config.mixed_precision:
+            self.scaler = GradScaler(
+                'cuda' if self.device.type == 'cuda' else 'cpu',
+                init_scale=self.config.training.initial_grad_scale,
+            )
+        else:
+            self.scaler = None
         
         # Initialize model
         self.model = self._create_model()
@@ -72,6 +80,9 @@ class Trainer:
         # For --resume: LoRA must be applied before _load_checkpoint so state dict keys match
         if self.config.training.lora_enabled:
             self._apply_lora()
+        if self.config.training.spectral_norm and self.config.text_prompted.enabled:
+            self.model.apply_spectral_norm()
+            print("Applied spectral normalization to projection layers")
         if self.config.training.freeze_encoder:
             self._apply_encoder_freezing()
 
@@ -646,9 +657,11 @@ class Trainer:
     def train_epoch(self) -> Dict[str, float]:
         """Train for one epoch (nnUNet style: fixed 250 iterations)"""
         self.model.train()
-        
+
         # Tracking variables
         loss_meter = AverageMeter()
+        nan_count = 0
+        consecutive_nan = 0
         
         # Reset visualization counter
         if self.visualizer is not None:
@@ -682,6 +695,7 @@ class Trainer:
             valid_bounds = batch.get('valid_bounds', None)
             weight_map = batch.get('weight_map', None)
             text_embedding = batch.get('text_embedding', None)
+            distance_field = batch.get('distance_field', None)
 
             # Standard mode: squeeze (B, 1, H, W, D) -> (B, H, W, D) for multi-class loss
             # Binary mode (num_classes=1): keep (B, 1, H, W, D) for binary CombinedLoss
@@ -701,7 +715,9 @@ class Trainer:
                 weight_map = weight_map.to(self.device, non_blocking=True)
             if text_embedding is not None:
                 text_embedding = text_embedding.to(self.device, non_blocking=True)
-            
+            if distance_field is not None:
+                distance_field = distance_field.to(self.device, non_blocking=True)
+
             # Convert valid_bounds tensor to list of tuples for loss function
             valid_bounds_list = None
             if valid_bounds is not None:
@@ -709,40 +725,60 @@ class Trainer:
 
             # Zero gradients
             self.optimizer.zero_grad()
-            
+
             # Forward pass with mixed precision
             with autocast(device_type='cuda', enabled=self.scaler is not None):
                 if text_embedding is not None:
                     outputs = self.model(images, text_embedding)
                 else:
                     outputs = self.model(images)
-                
+
                 if self.config.model.deep_supervision and isinstance(outputs, list):
-                    loss, loss_components = self.criterion(outputs, targets, valid_bounds=valid_bounds_list, weight_map=weight_map)
-                    # Use main output for metrics (highest resolution)
+                    loss, loss_components = self.criterion(outputs, targets, valid_bounds=valid_bounds_list, weight_map=weight_map, distance_field=distance_field)
                     main_output = outputs[0]
                 else:
-                    loss, loss_components = self.criterion(outputs, targets, valid_bounds=valid_bounds_list, weight_map=weight_map)
+                    loss, loss_components = self.criterion(outputs, targets, valid_bounds=valid_bounds_list, weight_map=weight_map, distance_field=distance_field)
                     main_output = outputs
-            
+
+            # --- NaN detection: check BEFORE backward to avoid corrupting momentum ---
+            current_loss = loss.item()
+            if not math.isfinite(current_loss):
+                nan_count += 1
+                consecutive_nan += 1
+                if nan_count <= 5:
+                    print(f"\n[NaN] epoch={self.epoch} iter={batch_idx} loss={current_loss}")
+                    self._log_nan_diagnostics()
+                elif nan_count % 50 == 0:
+                    print(f"\n[NaN] epoch={self.epoch} iter={batch_idx} (total NaN count: {nan_count})")
+                self.optimizer.zero_grad()
+                del images, targets, outputs, loss, loss_components, main_output
+                if consecutive_nan >= 10:
+                    print(f"\n[FATAL] 10 consecutive NaN iterations — stopping training")
+                    self._nan_abort = True
+                    break
+                continue
+            consecutive_nan = 0
+
             # Backward pass with gradient clipping
             if self.scaler is not None:
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 12)
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 12)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 12)
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 12)
                 self.optimizer.step()
-            
-            # Get current loss value
-            current_loss = loss.item()
-            
+
             # Extract loss component values before deletion (for wandb logging)
             loss_component_values = {k: v.item() if torch.is_tensor(v) else v for k, v in loss_components.items()}
-            
+
+            # Track output range for diagnostics
+            with torch.no_grad():
+                output_min = main_output.min().item()
+                output_max = main_output.max().item()
+
             # Update metrics
             loss_meter.update(current_loss, images.size(0))
             # Visualize every 50 batches if enabled (not at the very beginning)
@@ -752,26 +788,26 @@ class Trainer:
                     self.epoch, batch_idx, current_loss,
                     prefix="train"
                 )
-            
+
             # CRITICAL: Clear references to prevent memory leak
             del images, targets, outputs, loss, loss_components, main_output
-            
+
             # Calculate iteration time
             iter_time = time.time() - iter_start_time
-            
+
             # Reset iteration timer
             iter_start_time = time.time()
-            
+
             # Get current learning rate (use last group = primary/non-encoder LR)
             current_lr = self.optimizer.param_groups[-1]['lr']
-            
+
             # Update progress bar with current loss and iteration time
             pbar.set_postfix({
                 'loss': f'{current_loss:.4f}',
                 'avg_loss': f'{loss_meter.avg:.4f}',
                 'iter_time': f'{iter_time:.2f}s'
             })
-            
+
             # Log to wandb every iteration
             if wandb.run is not None:
                 global_step = self.epoch * self.config.training.num_iterations_per_epoch + batch_idx
@@ -779,24 +815,71 @@ class Trainer:
                     'train/loss_iter': current_loss,
                     'train/learning_rate': current_lr,
                     'train/iter_time': iter_time,
-                    'train/iteration': global_step
+                    'train/iteration': global_step,
+                    'debug/grad_norm': grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm,
+                    'debug/output_min': output_min,
+                    'debug/output_max': output_max,
                 }
+                if self.scaler is not None:
+                    log_dict['debug/scaler_scale'] = self.scaler.get_scale()
                 # Log encoder LR separately when using differential LR
                 if len(self.optimizer.param_groups) > 1:
                     log_dict['train/encoder_lr'] = self.optimizer.param_groups[0]['lr']
                 # Add loss components to log dict
                 for component_name, component_value in loss_component_values.items():
                     log_dict[f'train/loss_{component_name}'] = component_value
+                # Log weight norms every 50 iterations
+                if batch_idx % 50 == 0:
+                    log_dict.update(self._compute_weight_norms())
                 wandb.log(log_dict, step=global_step)
         
         # Close progress bar
         pbar.close()
-        
+
         # Compute epoch metrics
-        train_metrics = {}
+        train_metrics = {'loss': loss_meter.avg}
+        self.metrics_history['nan_count'].append(nan_count)
+        if nan_count > 0:
+            print(f"  NaN iterations this epoch: {nan_count}")
 
         return train_metrics
-    
+
+    def _compute_weight_norms(self) -> Dict[str, float]:
+        """Compute L2 norms of key model layers for diagnostics."""
+        norms = {}
+        layer_names = {
+            'debug/wnorm_project_text': 'project_text_embed',
+            'debug/wnorm_project_bottleneck': 'project_bottleneck_embed',
+            'debug/wnorm_transformer_norm': 'transformer_decoder.norm',
+            'debug/wnorm_decoder_proj_0': 'project_to_decoder_channels.0',
+            'debug/wnorm_decoder_stage4': 'decoder.stages.4',
+        }
+        for log_key, layer_prefix in layer_names.items():
+            total_norm = 0.0
+            found = False
+            for name, param in self.model.named_parameters():
+                if name.startswith(layer_prefix) and param.requires_grad:
+                    total_norm += param.data.norm(2).item() ** 2
+                    found = True
+            if found:
+                norms[log_key] = total_norm ** 0.5
+        return norms
+
+    def _log_nan_diagnostics(self):
+        """Log detailed diagnostics when NaN loss is detected."""
+        print("  --- NaN Diagnostics ---")
+        norms = self._compute_weight_norms()
+        for key, val in sorted(norms.items()):
+            print(f"  {key}: {val:.4f}")
+        if self.scaler is not None:
+            print(f"  scaler_scale: {self.scaler.get_scale():.0f}")
+        # Log to wandb
+        if wandb.run is not None:
+            wandb_dict = {**norms, 'debug/nan_event': 1}
+            if self.scaler is not None:
+                wandb_dict['debug/scaler_scale'] = self.scaler.get_scale()
+            wandb.run.log(wandb_dict)
+
     def validate_epoch(self) -> Dict[str, float]:
         """Validate for one epoch"""
         self.model.eval()
@@ -978,6 +1061,11 @@ class Trainer:
             self.metrics_history['train_loss'].append(train_metrics.get('loss', 0.0))
             lr = self.optimizer.param_groups[-1]['lr']
             self.metrics_history['learning_rate'].append(lr)
+
+            # Check for NaN abort
+            if self._nan_abort:
+                print(f"\nTraining aborted at epoch {epoch} due to persistent NaN loss.")
+                break
 
             # Update learning rate
             if self.scheduler is not None:

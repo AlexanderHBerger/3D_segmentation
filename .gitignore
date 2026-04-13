@@ -10,3 +10,9 @@ wandb
 *.code-workspace
 *.json
 /sweep_configs
+
+# Claude Code — ignore per-machine markers; allow config + hooks + skills + agents
+.claude/SANITY_OK_*
+!.claude/settings.json
+!.claude/hooks/*.sh
+!.claude/**/*.md

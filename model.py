@@ -52,6 +52,7 @@ def create_model(config) -> nn.Module:
             project_to_decoder_hidden_dim=tp.project_to_decoder_hidden_dim,
             patch_size=config.data.patch_size,
             deep_supervision=config.model.deep_supervision,
+            logit_clamp=config.training.logit_clamp,
         )
 
         # Apply weight initialization

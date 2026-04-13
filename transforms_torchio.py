@@ -394,6 +394,11 @@ class OversizedCrop:
             seg_cc = subject['seg_cc'][w_ini:w_ini + target_shape_whd[0], h_ini:h_ini + target_shape_whd[1], d_ini:d_ini + target_shape_whd[2]].data.clone()
             new_subject["seg_cc"] = tio.LabelMap(tensor=seg_cc, affine=subject['seg_cc'].affine)
 
+        # Crop seg_atlas (brain region labels) if present (distance field loss)
+        if 'seg_atlas' in subject:
+            seg_atlas = subject['seg_atlas'][w_ini:w_ini + target_shape_whd[0], h_ini:h_ini + target_shape_whd[1], d_ini:d_ini + target_shape_whd[2]].data.clone()
+            new_subject["seg_atlas"] = tio.LabelMap(tensor=seg_atlas, affine=subject['seg_atlas'].affine)
+
         new_subject["case_id"] = subject['case_id']
         if 'foreground_coords' in subject:
                 new_subject['foreground_coords'] = subject['foreground_coords']

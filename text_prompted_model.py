@@ -74,6 +74,7 @@ class TextPromptedModel(nn.Module):
         project_to_decoder_hidden_dim: int = 2048,
         patch_size: Tuple[int, int, int] = (128, 128, 128),
         deep_supervision: bool = False,
+        logit_clamp: float = 0.0,
     ) -> None:
         super().__init__()
 
@@ -82,6 +83,7 @@ class TextPromptedModel(nn.Module):
         self.query_dim = query_dim
         self.text_embedding_dim = text_embedding_dim
         self.project_to_decoder_hidden_dim = project_to_decoder_hidden_dim
+        self.logit_clamp = logit_clamp
 
         # ---- Build encoder from arch_params ----
         arch_kwargs = arch_params['architecture_kwargs']
@@ -170,6 +172,7 @@ class TextPromptedModel(nn.Module):
             deep_supervision=deep_supervision,
             num_maskformer_stages=num_maskformer_stages,
             num_heads=num_heads,
+            logit_clamp=logit_clamp,
         )
 
         # ---- Text-image fusion components ----
@@ -341,6 +344,18 @@ class TextPromptedModel(nn.Module):
         InitWeights_He(1e-2)(module)
         init_last_bn_before_add_to_0(module)
 
+    def apply_spectral_norm(self):
+        """Apply spectral normalization to projection layers to constrain Lipschitz constant."""
+        from torch.nn.utils import spectral_norm
+        for seq in [self.project_text_embed, self.project_bottleneck_embed]:
+            for i, module in enumerate(seq):
+                if isinstance(module, nn.Linear):
+                    seq[i] = spectral_norm(module)
+        for proj in self.project_to_decoder_channels:
+            for i, module in enumerate(proj):
+                if isinstance(module, nn.Linear):
+                    proj[i] = spectral_norm(module)
+
 
 class TextPromptedDecoder(nn.Module):
     """
@@ -360,10 +375,12 @@ class TextPromptedDecoder(nn.Module):
         deep_supervision: bool,
         num_maskformer_stages: int = 5,
         num_heads: int = 1,
+        logit_clamp: float = 0.0,
     ) -> None:
         super().__init__()
         self.deep_supervision = deep_supervision
         self.encoder = encoder
+        self.logit_clamp = logit_clamp
         self.num_classes = num_classes
         self.num_heads = num_heads
 
@@ -452,6 +469,8 @@ class TextPromptedDecoder(nn.Module):
                 seg_pred = torch.einsum(
                     'b c h w d, b n c -> b n h w d', x, mask_embeddings[-1]
                 )
+                if self.logit_clamp > 0:
+                    seg_pred = seg_pred.clamp(-self.logit_clamp, self.logit_clamp)
                 seg_outputs.append(seg_pred)
             elif stage_idx >= len(self.stages) - len(mask_embeddings):
                 # Intermediate stages: multi-head fusion
@@ -465,7 +484,10 @@ class TextPromptedDecoder(nn.Module):
                     x, mask_embedding_reshaped
                 )
                 x = torch.cat((x, fusion_features), dim=1)
-                seg_outputs.append(self.seg_layers[stage_idx](x))
+                seg_out = self.seg_layers[stage_idx](x)
+                if self.logit_clamp > 0:
+                    seg_out = seg_out.clamp(-self.logit_clamp, self.logit_clamp)
+                seg_outputs.append(seg_out)
 
             lres_input = x
 
