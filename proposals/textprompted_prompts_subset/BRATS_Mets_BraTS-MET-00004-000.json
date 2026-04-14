@@ -1,0 +1,35 @@
+[
+  {
+    "prompt": "subcentimeter metastatic focus in left superior temporal cortex",
+    "lesion_numbers": [
+      1
+    ],
+    "prompt_type": "lesion"
+  },
+  {
+    "prompt": "metastatic lesion in left precentral cortex",
+    "lesion_numbers": [
+      2,
+      3,
+      4,
+      5,
+      6
+    ],
+    "prompt_type": "region"
+  },
+  {
+    "prompt": "multiple brain metastases",
+    "lesion_numbers": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9
+    ],
+    "prompt_type": "global"
+  }
+]

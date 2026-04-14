@@ -1,0 +1,30 @@
+[
+  {
+    "prompt": "moderate-sized metastatic focus in left fusiform cortex",
+    "lesion_numbers": [
+      1
+    ],
+    "prompt_type": "lesion"
+  },
+  {
+    "prompt": "metastatic deposit in left rostral middle frontal cortex",
+    "lesion_numbers": [
+      2
+    ],
+    "prompt_type": "region"
+  },
+  {
+    "prompt": "solitary brain metastasis",
+    "lesion_numbers": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8
+    ],
+    "prompt_type": "global"
+  }
+]

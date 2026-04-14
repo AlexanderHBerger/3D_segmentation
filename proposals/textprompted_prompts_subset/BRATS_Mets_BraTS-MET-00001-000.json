@@ -1,0 +1,29 @@
+[
+  {
+    "prompt": "large metastasis in right caudal middle frontal cortex",
+    "lesion_numbers": [
+      1
+    ],
+    "prompt_type": "lesion"
+  },
+  {
+    "prompt": "metastatic lesion in right lateral occipital cortex",
+    "lesion_numbers": [
+      2
+    ],
+    "prompt_type": "region"
+  },
+  {
+    "prompt": "metastatic disease",
+    "lesion_numbers": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "prompt_type": "global"
+  }
+]
