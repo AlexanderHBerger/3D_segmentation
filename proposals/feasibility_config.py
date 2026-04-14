@@ -3,13 +3,23 @@
 # Disables augmentation, weight map, and validation; keeps everything else default.
 #
 # Used via: python main.py --config_path proposals/feasibility_config.py ...
+import importlib.util
 from dataclasses import fields
+from pathlib import Path
 
-from config import get_config as _get_default_config
+
+def _load_default_config():
+    # Load the real config.py by absolute path to avoid the
+    # sys.modules['config'] shadow set by main.load_config_from_path.
+    real_path = Path(__file__).resolve().parent.parent / "config.py"
+    spec = importlib.util.spec_from_file_location("_real_config", real_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.get_config()
 
 
 def get_config():
-    cfg = _get_default_config()
+    cfg = _load_default_config()
 
     # --- Disable all augmentation ---
     # Iterate over every field in AugmentationConfig whose name ends in "_prob"
