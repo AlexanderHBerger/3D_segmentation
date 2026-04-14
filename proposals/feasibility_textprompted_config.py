@@ -47,6 +47,14 @@ def get_config():
     # No auxiliary spatial-prior loss — keep the signal clean for the feasibility test.
     cfg.text_prompted.distance_field_weight = 0.0
 
+    # Bump patches_per_volume to avoid dataloader starvation on tiny max_samples.
+    # With max_samples=1 and text-prompted mode, default 10 patches/volume made
+    # GPU util drop to 0% (observed on job 908780, ~320s/epoch). 200 keeps the
+    # same patch stream per volume but amortizes reload across ~20 iterations
+    # instead of 1, which is what the standard-mode run got for free with its
+    # lower per-iter compute cost.
+    cfg.data.patches_per_volume = 200
+
     # NOTE: no custom splits file. `textprompted_case_selection.py` verifies
     # that the curated cases occupy positions 0..4 of the fold-0 train list,
     # so `main.py --max_samples {1,5}` lands on them directly. If that
