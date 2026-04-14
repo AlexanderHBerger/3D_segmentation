@@ -32,6 +32,10 @@ def get_config():
     # --- Disable weight map on CE (simpler textbook CE) ---
     cfg.training.use_weight_map = False
 
+    # --- Loss function: dice_ce (soft Dice + CE) ---
+    # default 'combined' is unregistered in get_loss_function (losses.py:803)
+    cfg.training.loss_function = "dice_ce"
+
     # --- Effectively disable validation ---
     # val_check_interval is in epochs; set it well beyond any epoch budget we
     # plan to run so _validate() is never called.
