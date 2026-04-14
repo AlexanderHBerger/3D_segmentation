@@ -82,7 +82,28 @@ class ImportsCheck(Check):
         for mod in ("config", "model", "architectures", "losses", "data_loading_native"):
             importlib.import_module(mod)
         from config import get_config  # type: ignore
-        ctx["config"] = get_config()
+        cfg = get_config()
+        # Mirror main.py's --text-prompted override so `create_model(cfg)` returns
+        # the TextPromptedModel wrapper (whose forward accepts text_embedding=).
+        if ctx.get("text_prompted", False):
+            cfg.text_prompted.enabled = True
+            # The transformer's positional encoding is baked in at model-
+            # construction time from cfg.data.patch_size, so the synthetic batch
+            # must match. We also need n_stages > num_maskformer_stages (the
+            # TextPromptedDecoder asserts this implicitly: its stage-0 transpconv
+            # expects the bottleneck to already carry num_heads extra channels,
+            # which only happens when there are more encoder stages than
+            # maskformer stages). Default num_maskformer_stages=5 → need ≥6
+            # stages → patch_size ≥ 128³. 128³ is the smallest value that
+            # satisfies both the `min_feature_map_size=4` downsampling schedule
+            # and the maskformer-stage constraint.
+            sanity_patch = tuple(min(int(p), 128) for p in cfg.data.patch_size)
+            cfg.data.patch_size = sanity_patch
+            # Re-run post_init so text-prompted side-effects (num_classes=1,
+            # decoder_layer clamp, mirror disable) apply to the mutated cfg,
+            # matching the pattern used in proposals/feasibility_textprompted_config.py.
+            cfg.__post_init__()
+        ctx["config"] = cfg
 
 
 class OverfitOneBatchCheck(Check):
@@ -266,13 +287,23 @@ def _first_sample(cfg, seed: int):
 
 
 def _synthetic_batch(cfg, device, zeros: bool = False, text_prompted: bool = False):
-    """Build a synthetic batch. Uses a small patch (≤ 48³) regardless of config,
-    so the sanity overfit check converges quickly — we're testing gradient flow,
-    not end-to-end convergence.
+    """Build a synthetic batch.
+
+    Standard mode: uses a small patch (≤ 64³) regardless of config, since the
+    CNN is fully convolutional and size-agnostic — we want the overfit check
+    to converge quickly.
+
+    Text-prompted mode: must match cfg.data.patch_size exactly, because the
+    TextPromptedModel bakes positional encodings and decoder-stage shapes in at
+    construction time. The ImportsCheck already shrinks cfg.data.patch_size to
+    the sanity size (128³) for text-prompted runs.
     """
-    # Small synthetic patch; must be divisible by 32 (ResUNet has 6 stages → 2^5 downsampling).
     cfg_patch = list(getattr(cfg.data, "patch_size", [64, 64, 64]))
-    patch = [min(int(p), 64) for p in cfg_patch]
+    if text_prompted:
+        patch = [int(p) for p in cfg_patch]
+    else:
+        # Small synthetic patch; must be divisible by 32 (ResUNet has 6 stages → 2^5 downsampling).
+        patch = [min(int(p), 64) for p in cfg_patch]
     B = 1
     image = torch.zeros((B, 1, *patch), device=device) if zeros else torch.randn((B, 1, *patch), device=device)
     if text_prompted:
@@ -341,7 +372,9 @@ def main() -> int:
                 registry.append(OPT_IN_CHECKS[name])
 
     for chk in registry:
-        if args.only and chk.name not in args.only:
+        # ImportsCheck populates ctx["config"] — it's a prerequisite for every
+        # other check, so it always runs regardless of --only filtering.
+        if args.only and chk.name not in args.only and chk.name != "imports":
             continue
         if chk.name in args.skip:
             print(f"[skip] {chk.name}")
