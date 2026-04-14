@@ -4,6 +4,7 @@
 #
 # Used via: python main.py --config_path proposals/feasibility_config.py ...
 import importlib.util
+import sys
 from dataclasses import fields
 from pathlib import Path
 
@@ -14,6 +15,7 @@ def _load_default_config():
     real_path = Path(__file__).resolve().parent.parent / "config.py"
     spec = importlib.util.spec_from_file_location("_real_config", real_path)
     module = importlib.util.module_from_spec(spec)
+    sys.modules["_real_config"] = module
     spec.loader.exec_module(module)
     return module.get_config()
 
