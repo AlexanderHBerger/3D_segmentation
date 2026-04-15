@@ -43,8 +43,13 @@ def get_config():
     # plan to run so _validate() is never called.
     cfg.training.val_check_interval = 10_000
 
-    # --- Smallest ResUNet for fastest feasibility iteration ---
-    cfg.model.model_size = "S"
+    # --- ResUNet-B: matches the VoxTell pretrained checkpoint's width schedule
+    # (base=32, stages 32/64/128/256/320/320) so finetune runs can load the
+    # encoder weights without size mismatches. Original (b') run used "S" for
+    # fastest iteration; switched to "B" for apples-to-apples comparison with
+    # VoxTell-init siblings (FT, FE, LoRA). B at patch_size=192 may require
+    # batch_size=1 on 40GB GPUs; experimenter will confirm on OOM.
+    cfg.model.model_size = "B"
 
     # --- Dataset018_TextPrompted: .npz files, 5-fold splits_final.json present ---
     cfg.data.data_path = "/ministorage/ahb/data/nnUNet_preprocessed/Dataset018_TextPrompted"
