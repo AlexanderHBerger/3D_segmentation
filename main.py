@@ -12,10 +12,36 @@ sys.path.append(str(Path(__file__).parent))
 
 
 def load_config_from_path(config_path: str):
-    """Load config module from a specific file path."""
-    spec = importlib.util.spec_from_file_location("config", config_path)
+    """Load config module from a specific file path (snapshot).
+
+    IMPORTANT: some downstream code paths call `torch.load(..., weights_only=False)`
+    on checkpoints whose pickle stream carries fully-qualified class paths like
+    `config.Config`. If we overwrite sys.modules['config'] with the snapshot
+    (which typically exposes `get_config()` but no top-level `Config` class),
+    the unpickler later raises:
+        AttributeError: Can't get attribute 'Config' on <module 'config' from '<snapshot path>'>
+
+    Fix: pre-register the REAL repo-root `config.py` as sys.modules['config']
+    BEFORE any subsequent torch.load call, and load the snapshot under a
+    non-shadowing module name derived from its path. Callers still receive a
+    `cfg` object from the snapshot's `get_config()`.
+    """
+    # (1) Pre-register the real repo-root config.py as sys.modules['config'].
+    repo_root = Path(__file__).resolve().parent
+    real_config_path = repo_root / "config.py"
+    real_spec = importlib.util.spec_from_file_location("config", real_config_path)
+    real_module = importlib.util.module_from_spec(real_spec)
+    sys.modules['config'] = real_module
+    real_spec.loader.exec_module(real_module)
+
+    # (2) Load the snapshot under a non-shadowing, path-derived name so it
+    #     does not evict the real `config` module from sys.modules.
+    snapshot_name = Path(config_path).stem or "config_snapshot"
+    if snapshot_name == "config":
+        snapshot_name = "config_snapshot"
+    spec = importlib.util.spec_from_file_location(snapshot_name, config_path)
     config_module = importlib.util.module_from_spec(spec)
-    sys.modules['config'] = config_module
+    sys.modules[snapshot_name] = config_module
     spec.loader.exec_module(config_module)
     return config_module.get_config()
 
