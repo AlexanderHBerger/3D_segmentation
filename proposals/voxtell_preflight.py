@@ -3,9 +3,13 @@ VoxTell-init preflight for the feasibility-overfit-fold0 text-prompted runs.
 
 Validates, before burning ~20h of GPU across 3 finetune modes, that:
   (a) The VoxTell checkpoint's state_dict loads into our text-prompted
-      ResUNet-S with the expected missing/unexpected-key pattern (encoder
-      keys match; transformer-decoder / text-projection / mask-projection
-      keys are missing — they're the head we're randomly initializing).
+      ResUNet-S with a healthy overlap. VoxTell was itself built as
+      TextPromptedModel(architecture="ResUNet") via
+      convert_voxtell_checkpoint.py, so the checkpoint already contains
+      the full transformer decoder + projection weights. The ideal
+      outcome is `missing == 0 and unexpected == 0`; a smaller overlap
+      is still acceptable as long as >=90% of the model's parameters
+      are populated from the checkpoint.
   (b) Trainable-parameter counts under each of the three finetune modes
       (full-FT, --freeze_encoder, --freeze_encoder --lora) fall in the
       expected bands.
@@ -24,8 +28,10 @@ Env vars:
 
 Exits non-zero on:
   - model build failure
-  - strict-load returns zero missing keys (transformer decoder should
-    NOT match — that would indicate we loaded something unexpected)
+  - strict-load raises before producing missing/unexpected (e.g. size
+    mismatch)
+  - fewer than 50% of the model's parameters were populated from the
+    checkpoint
   - FE mode reports > 80% trainable (freeze didn't bind)
   - backward produces NaN/Inf loss
   - grad-flow assertions violated
@@ -111,7 +117,18 @@ def build_model(cfg):
 # ---------------------------------------------------------------------------
 
 def strict_load_report(model: nn.Module, ckpt_path: Path):
-    """Run strict=False load and return (missing, unexpected)."""
+    """Run strict=False load and return (missing, unexpected).
+
+    VoxTell is built as TextPromptedModel(architecture="ResUNet") by
+    convert_voxtell_checkpoint.py — the checkpoint already contains the
+    full transformer decoder and text/mask projection weights. The ideal
+    outcome of loading it into our text-prompted ResUNet is therefore
+    `missing == 0 and unexpected == 0` (clean strict load). Smaller
+    overlaps are still tolerated as long as >=90% of the model's
+    parameters are populated from the checkpoint; we only fail when the
+    load raises before producing missing/unexpected (e.g. shape
+    mismatch) or when fewer than 50% of model keys were populated.
+    """
     print(f"\n{'=' * 80}")
     print("CHECK (a): state_dict load from VoxTell checkpoint")
     print(f"{'=' * 80}")
@@ -123,6 +140,8 @@ def strict_load_report(model: nn.Module, ckpt_path: Path):
     state = ckpt.get("model_state_dict", ckpt)
     print(f"  Checkpoint state_dict keys: {len(state)}")
 
+    # Any exception from load_state_dict (e.g. RuntimeError on size
+    # mismatch) propagates out — that's a hard CHECK (a) failure.
     missing, unexpected = model.load_state_dict(state, strict=False)
     print(f"  Missing keys:    {len(missing)}")
     print(f"  Unexpected keys: {len(unexpected)}")
@@ -139,34 +158,35 @@ def strict_load_report(model: nn.Module, ckpt_path: Path):
     print("  Unexpected (first 10):")
     print(_preview(unexpected))
 
-    # Sanity: transformer-decoder / project_text_embed / project_bottleneck_embed
-    # / project_to_decoder_channels MUST be in missing — they're the
-    # text-prompt-specific head we're initializing from scratch.
-    expected_missing_prefixes = (
-        "transformer_decoder.",
-        "project_text_embed.",
-        "project_bottleneck_embed.",
-        "project_to_decoder_channels.",
-    )
-    matched = [
-        k for k in missing if k.startswith(expected_missing_prefixes)
-    ]
-    if len(missing) == 0:
-        print(
-            "  [ERR] zero missing keys — that can't be right; our "
-            "text-prompt head shouldn't be in the VoxTell checkpoint."
-        )
-        raise SystemExit(2)
-    if not matched:
-        print(
-            "  [ERR] no missing keys matched any text-prompt head prefix. "
-            "That's surprising — verify the checkpoint is actually VoxTell."
-        )
-        raise SystemExit(2)
+    total_model_keys = len(model.state_dict())
+    matched = max(0, total_model_keys - len(missing))
+    frac_matched = (matched / total_model_keys) if total_model_keys else 0.0
     print(
-        f"  text-prompt head missing keys: {len(matched)} "
-        f"(covers {expected_missing_prefixes})"
+        f"  Model keys: {total_model_keys} | matched from ckpt: {matched} "
+        f"({100.0 * frac_matched:.2f}%)"
     )
+
+    if len(missing) == 0 and len(unexpected) == 0:
+        print("  [OK] clean strict load — VoxTell checkpoint fully populated model.")
+    elif frac_matched >= 0.90:
+        print(
+            f"  [OK] {100.0 * frac_matched:.2f}% of model params populated "
+            f"(>=90% threshold). Residual missing/unexpected reported above."
+        )
+    elif frac_matched < 0.50:
+        print(
+            f"  [ERR] only {100.0 * frac_matched:.2f}% of model params "
+            f"populated from checkpoint (<50%). Checkpoint likely does not "
+            f"match this model."
+        )
+        raise SystemExit(2)
+    else:
+        print(
+            f"  [WARN] only {100.0 * frac_matched:.2f}% of model params "
+            f"populated from checkpoint (between 50% and 90%). Continuing — "
+            f"downstream grad-flow checks must still pass."
+        )
+
     return missing, unexpected
 
 
