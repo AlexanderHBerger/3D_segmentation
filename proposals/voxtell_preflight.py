@@ -38,11 +38,35 @@ import sys
 from pathlib import Path
 from typing import Tuple
 
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# ---------------------------------------------------------------------------
+# Pre-register the REAL config module as sys.modules["config"] BEFORE any
+# torch import / torch.load call. The VoxTell checkpoint was pickled when
+# training imported `from config import get_config`, so the pickle stream
+# carries the fully-qualified class path `config.Config`. If we later
+# overwrite `sys.modules["config"]` with the feasibility snapshot (which
+# does NOT define a top-level `Config`), `torch.load(..., weights_only=False)`
+# fails with AttributeError: Can't get attribute 'Config' on <module 'config'...>.
+#
+# Fix: pre-register the real repo-root config.py under the name "config"
+# here. The feasibility snapshot is then loaded below under a non-shadowing
+# name ("feasibility_snapshot") so it doesn't evict the real module pickle
+# needs. The snapshot's internal _load_default_config() registers
+# sys.modules["_real_config"] on its own — independent namespace, no
+# interaction.
+# ---------------------------------------------------------------------------
+_REAL_CONFIG_PATH = REPO_ROOT / "config.py"
+_spec_rc = importlib.util.spec_from_file_location("config", _REAL_CONFIG_PATH)
+_mod_rc = importlib.util.module_from_spec(_spec_rc)
+sys.modules["config"] = _mod_rc
+_spec_rc.loader.exec_module(_mod_rc)
+
 import torch
 import torch.nn as nn
 
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = REPO_ROOT / "proposals/feasibility_textprompted_config.py"
 CKPT_PATH = Path(
     os.environ.get(
@@ -59,11 +83,15 @@ sys.path.insert(0, str(REPO_ROOT))
 # ---------------------------------------------------------------------------
 
 def load_config():
-    """Load the text-prompted feasibility config via importlib (matches
-    the inspect_low_dice.py snapshot pattern)."""
-    spec = importlib.util.spec_from_file_location("config", CONFIG_PATH)
+    """Load the text-prompted feasibility config via importlib.
+
+    Load under the name "feasibility_snapshot" (not "config") so we don't
+    evict the pre-registered real `config` module — torch.load on the
+    VoxTell checkpoint needs `config.Config` to resolve to the real class.
+    """
+    spec = importlib.util.spec_from_file_location("feasibility_snapshot", CONFIG_PATH)
     m = importlib.util.module_from_spec(spec)
-    sys.modules["config"] = m
+    sys.modules["feasibility_snapshot"] = m
     spec.loader.exec_module(m)
     return m.get_config()
 
