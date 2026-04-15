@@ -1037,8 +1037,24 @@ class Trainer:
         else:
             print("Validation: DISABLED (train_on_all mode)")
 
-        # Run initial validation before training when using pretrained weights
-        if self.init_checkpoint is not None and not self.train_on_all and self.val_loader is not None and self.epoch == 0:
+        # Run initial validation before training when using pretrained weights.
+        # Skip when the val dataset is effectively empty (virtual size == 0) —
+        # this happens e.g. in text-prompted feasibility runs where the curated
+        # per-lesion subset only covers training cases and the val loader
+        # cannot produce text_embedding batches. Calling self.model(images)
+        # in validate_epoch would then raise TypeError on the missing
+        # text_embedding positional arg. PatchDataset exposes __len__
+        # (== virtual size; see line 1036 which already relies on it).
+        val_dataset_size = (
+            len(self.val_loader.dataset) if self.val_loader is not None else 0
+        )
+        if (
+            self.init_checkpoint is not None
+            and not self.train_on_all
+            and self.val_loader is not None
+            and self.epoch == 0
+            and val_dataset_size > 0
+        ):
             print(f"\n{'='*60}")
             print("Running initial validation (pretrained weight baseline)")
             print(f"{'='*60}")
@@ -1050,6 +1066,17 @@ class Trainer:
                     'epoch': -1,
                     **{f'val/{k}': v for k, v in init_val_metrics.items()},
                 }, step=0)
+        elif (
+            self.init_checkpoint is not None
+            and not self.train_on_all
+            and self.val_loader is not None
+            and self.epoch == 0
+            and val_dataset_size == 0
+        ):
+            print(
+                "Skipping initial pre-validation — val dataset virtual size is 0 "
+                "(e.g. text-prompted val has no prompt-bearing cases)."
+            )
 
         for epoch in range(self.epoch, self.config.training.max_epochs):
             self.epoch = epoch
