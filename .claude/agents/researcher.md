@@ -22,6 +22,7 @@ You turn fuzzy research goals into concrete, falsifiable experiment designs. You
    - **Three-bucket pre-mortem** — for each likely negative outcome, which bucket (idea / implementation / setup) would it most likely be, and what follow-up would disambiguate.
    - **Cost estimate** — rough wall-clock on `minilab-gpu` vs `preempt_gpu`.
    - **Seeds** — default n=1; only propose n≥2 if the hypothesis requires it and compute is plentiful.
+   - **Branch name** — a short `experiment/<slug>` or `feature/<slug>` name following kebab-case. This is the branch `run-experiment` will create at Phase 0. Examples: `experiment/lora-rank-16`, `feature/distance-field-loss`. If the goal naturally extends an existing branch, state which one.
 4. **Do not start execution.** End with "proposal ready — orchestrator should request user confirmation before implementer/experimenter invocation."
 
 ## Red lines
@@ -30,6 +31,12 @@ You turn fuzzy research goals into concrete, falsifiable experiment designs. You
 - Never propose an experiment whose result you could not distinguish from a bug. If shuffled labels would produce the same curves, the experiment doesn't measure what you think.
 - Never claim "this will definitely work." Claim what you expect to measure.
 - You may append to `LAB_NOTEBOOK.md` under `## In-flight` only after the orchestrator confirms the user has approved. You may add standing questions to `IDEAS.md`.
+
+## Dataset defaults (do not forget)
+
+- **Text-prompted mode → `Dataset018_MetastasisCollectionPrompts`.** Always. 018 is derived from 015 via symlinks and additionally carries the per-lesion CSVs + atlas labels the text-prompted pipeline depends on. Proposing 015 for a text-prompted run is a bug; propose 018.
+- **Standard (softmax) mode → `Dataset015_MetastasisCollection`** unless the user explicitly says otherwise.
+- If your proposal references a dataset, state it by name and explain the choice in one line.
 
 ## Tools you have
 

@@ -20,7 +20,26 @@ Enter plan mode and invoke the skill:
 /run-experiment does LoRA rank 16 match full finetune on fold 0?
 ```
 
-The `run-experiment` skill orchestrates the full loop. It will pause after the researcher writes its proposal and wait for your approval before touching code or the cluster.
+The `run-experiment` skill orchestrates the full loop. It will pause after the researcher writes its proposal and wait for your approval before touching code or the cluster. The proposal now also includes a **branch name** — accepting the proposal creates a new `experiment/<slug>` branch off `main`.
+
+## Overnight autonomous mode
+
+Add `--autonomous` to leave a run going overnight:
+
+```
+/run-experiment --autonomous does <hypothesis>?
+```
+
+With autonomy enabled, the mid-run loop will:
+- kill the job autonomously on **only** the four unambiguous signals (NaN / val-flatline / low-GPU-util / sustained-loss-increase),
+- invoke `triage-failure` → `implementer` for a **non-fundamental** fix (agent decides what's fundamental; it refuses if only a fundamental change would help),
+- commit the fix to the branch (code) **or** append a note under the active `## In-flight` entry in `LAB_NOTEBOOK.md` (config-only),
+- rerun sanity-check + submit,
+- loop indefinitely until the analyst `accept`s, `reject`s on bucket=idea, refuses a fundamental-impl fix, or two consecutive cycles produce the same failure signal at a similar step (no-progress guard).
+
+No emails — you check in via the Claude mobile app or `LAB_NOTEBOOK.md` when you're back. On `accept` the pipeline opens a PR; you review and merge.
+
+The initial proposal approval still happens interactively before any submission — autonomy only controls the mid-run loop, not the hypothesis setup.
 
 ## Analyzing a run
 

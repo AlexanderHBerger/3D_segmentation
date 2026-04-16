@@ -78,6 +78,40 @@ Dataset018 has 3,116 training cases from 3 sources (BRATS, Stanford, NYU). More 
 
 ## Loss Functions & Training
 
+### CE component likely harmful for tiny-foreground prompts — test by ablation
+
+**Status:** Hypothesis — ready to test
+**Priority:** Medium-high (blocks accurate tiny-target dice)
+**Trigger:** Per-prompt failures concentrate on tiny foregrounds across every feasibility setting tried (standard-mode 10-sample eval, text-prompted b', VoxTell-init 4-way).
+
+Observed across feasibility experiments: lesion-prompt dice is unstable and the two GT=12 sub-voxel-scattered cases score dice=0.000 in every model variant we've tried. Hypothesis: the **CE component of `dice_ce` is dominated by the vast background** when foregrounds are 10¹-10² voxels on a 192³ volume, asymptotic-0 CE drags the optimizer away from the tiny-target dice basin, and the gradient scale becomes extreme.
+
+**Experiment design:**
+- Rerun the b' / b'' feasibility overfit setup with `training.loss_function = "dice"` only (no CE); all else unchanged. Compare per-prompt dice vs the `dice_ce` baselines we already have.
+- If tiny-target dice recovers → hypothesis confirmed. Follow-up: lower CE weight (or schedule) as the production compromise.
+- If it does not recover → tiny-target failure is a fundamental data / capacity issue, not a loss-composition issue.
+
+**Related historical note (worth preserving):** earlier unlogged runs on this task hit NaNs that were initially attributed to mixed precision. Root cause was **exploding gradients / weights from exactly the task-difficulty + miscalibrated-loss dynamic above.** Future NaN triage on this task should suspect loss/gradient calibration first, precision second.
+
+### Prompt-size-aware loss weighting / curriculum
+
+**Status:** Idea — needs design
+**Priority:** Medium (blocks per-prompt parity across types)
+**Relates to:** CE ablation above (may subsume or complement); distance-field loss (below, shares the "per-voxel weighting" machinery).
+
+Per-prompt evaluations consistently show order-of-magnitude dice gaps by prompt type: global prompts (≥10⁴ foreground voxels) ≥0.97; lesion prompts (10¹-10² voxels) unstable with 1-voxel-shift artifacts; region prompts (10²-10³ voxels) the main bottleneck around 0.50. The loss is a single scalar averaged across prompt types, but the optimization signal per pixel differs by orders of magnitude between a "whole-tumor" global prompt and a single-lesion prompt.
+
+**Candidate approaches (ordered by implementation cost):**
+- **Per-target-normalized dice**: normalize each sample's contribution by target volume so a single-lesion case contributes on par with a global case.
+- **Size-aware sample weighting in the dataloader**: oversample small-target prompts.
+- **Curriculum**: start on large-target prompts, gradually introduce small-target prompts once a prior is established.
+- **Per-prompt-type loss heads**: separate dice / BCE streams per type, additively combined.
+
+**Open questions:**
+- Is "target size" a good proxy for "difficulty"? A large but heterogeneous target may be harder than a small isolated one.
+- Interaction with distance-field loss (below) — co-design probably needed; the voxel-wise weighting scheme should not double-count.
+- At deep-supervision layers feature-map resolution changes effective target size — does normalization need to be level-aware?
+
 ### Distance-field-based loss penalizing anatomically distant false positives
 
 **Status:** Idea — needs prototyping  
@@ -101,6 +135,63 @@ Currently, all false positive voxels are penalized equally regardless of how far
 - Only applies to region-level and lesion-level prompts — global prompts have no target region. Need to handle this gracefully (zero out the distance loss for global prompts).
 - How to normalize the distance field across different brain sizes / crop regions?
 - Interaction with deep supervision: apply at all resolution levels or only full-res?
+
+---
+
+## Interpretability & Analysis
+
+### Investigate prompt embedding geometry and cross-attention behavior
+
+**Status:** Idea — analysis work on existing models  
+**Priority:** Medium  
+**Cost:** Low — mostly embedding/attention analysis on trained checkpoints, no new training required.
+
+We don't yet know what the model is actually learning about prompts. A set of targeted analyses on the Qwen3 embeddings (pre- and post-finetuning) and on the decoder cross-attention would tell us whether the prompt representation is doing what we hope.
+
+**Questions to answer:**
+- **Paraphrase invariance:** Are semantically equivalent prompts clustered in embedding space? E.g., "left frontal lobe", "in the left frontal lobe", "lesion in left frontal cortex" — should all be near each other.
+- **Spatial coherence:** Are anatomically adjacent regions close in latent space? (Left frontal vs. left temporal closer than left frontal vs. right occipital?) Pre-trained Qwen3 probably won't have this — interesting to see if finetuning induces it.
+- **Laterality:** Are left/right pairs handled correctly? Does "left X" cluster with "right X" (similar region, different side) or with other left-side structures (same side, different region)? Clinically, laterality is critical and a common failure mode for NLP models.
+- **Cross-attention evolution:** Qwen3 embeddings are **frozen** in our setup — all adaptation happens in the decoder cross-attention. How does training reshape where prompts attend in the image? Does a "left frontal" prompt actually focus attention on the left frontal region, or does it just shift the global prediction threshold?
+
+**What's needed:**
+- Embedding analysis: UMAP/t-SNE plots of prompts grouped by region, side, phrasing. Compare pre-trained Qwen3 vs. our finetuned version.
+- Cross-attention visualization: overlay attention maps on images for representative prompts. Check attention specificity before vs. after training.
+- Pairwise distance analyses for specific questions (laterality, adjacency).
+
+**Open questions:**
+- Which checkpoints to compare — best-val vs. final vs. early training?
+- Visualization sanity: attention maps at which decoder layer / resolution level are most informative?
+
+**Notes:**
+- Valuable as a paper contribution regardless of outcome: confirming sensible structure validates the approach; finding pathologies (e.g., left/right confusion) is itself a finding worth reporting.
+- Good candidate for figures in a paper — attention maps and embedding plots are visually compelling and easy for reviewers to grasp.
+
+### Prompt-embedding adapter on top of frozen Qwen3
+
+**Status:** Idea — contingent on analysis findings  
+**Priority:** Low-Medium  
+**Depends on:** Embedding geometry analysis (above) revealing concrete pathologies to fix.
+
+Since Qwen3 embeddings are frozen, any structural issues in the embedding space (e.g., left/right confusion, poor region adjacency) cannot be fixed by training the encoder. A lightweight learnable adapter — applied to the frozen embedding before it enters the decoder — could reshape the space for the segmentation task without the cost of finetuning a 4B-parameter LM.
+
+**Adapter options (ordered by parameter count):**
+- Linear projection or MLP on the pooled embedding.
+- Low-rank (LoRA-style) adapter on the embedding.
+- Small transformer block that sees the full token sequence (richer, but more params — still tiny relative to the LM).
+
+**Why this is interesting:**
+- Cheap to train (few hundred K to a few M params vs. 4B).
+- Targets a specific failure mode — only worth doing if the geometry analysis identifies one.
+- Potentially improves paraphrase invariance and laterality encoding if those turn out to be weak.
+
+**Open questions:**
+- Where to insert? Between Qwen3 output and the first cross-attention layer, or mixed in at multiple decoder stages?
+- Does an adapter actually generalize to unseen phrasings at inference, or does it overfit to the training prompt distribution?
+- Alternative: skip the adapter and just train the decoder longer / with more prompt variation. Adapter only makes sense if the bottleneck is provably in the embedding representation, not the decoder's use of it.
+
+**Notes:**
+- This is a "fix" idea — don't build it speculatively. Run the analysis first, confirm a concrete pathology, then decide if an adapter is the right tool (vs. decoder changes, more training data, different prompt templates).
 
 ---
 

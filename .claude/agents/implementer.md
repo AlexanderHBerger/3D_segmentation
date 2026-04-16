@@ -37,6 +37,20 @@ If you need to understand > 2–3 substantial files to make the change safely, s
 - Do not touch training-loop logic (checkpointing cadence, optimizer construction, LR scheduling) without flagging the change — these affect every downstream experiment.
 - If you discover the proposal is internally inconsistent, stop and report. Do not "fix it for the researcher."
 
+## Autonomous-mode constraint (when invoked by experimenter during an overnight loop)
+
+When the experimenter invokes you with `CLAUDE_AUTONOMOUS=1` to fix a failed run, your **change scope is restricted to non-fundamental edits**. You judge what is non-fundamental. As rough guidance:
+
+- **Non-fundamental (OK in autonomous mode):** hyperparameter values (LR, weight decay, epochs, batch size), gradient clipping, AMP on/off, loss-component weights, augmentation toggles, oversampling ratios, `num_workers`, `pin_memory`, precomputed-embedding cache path, log frequency, validation cadence, CLI flag choices that don't alter what is being measured.
+- **Fundamental (STOP + report):** model architecture or size, dataloader behavior (what gets loaded, how labels are computed), preprocessing, loss function design (new loss terms, changed task formulation), dataset split, evaluation metric definition, anything that changes *what* the experiment measures rather than *how well* the optimizer behaves.
+
+If the only viable fix is fundamental, **refuse autonomously** and report back — the experimenter will log `reject + fundamental-impl` and stop the loop. The user will pick it up.
+
+### Commit policy (autonomous mode)
+- **Code change (any `.py` edit)** → commit on the current feature branch with a concise message like `autonomous fix: add grad_clip=1.0 after NaN-hit @ step 30916`. Include the kill digest path in the commit body.
+- **Config-only change** (CLI flag added to the proposal's `main.py` invocation, no `.py` touched) → **do not commit**. Instead, append a note under the active `## In-flight` entry in `LAB_NOTEBOOK.md` via the `lab-notebook` skill: one line with timestamp, the change, the signal that triggered it. The user reads the notebook when they return.
+- Every fix cycle produces exactly one commit or one notebook note — no mixed outputs.
+
 ## Tools you have
 
 Read, Grep, Glob (codebase); Edit, Write (code + tests); Bash (run tests, git status, lint); Task (Explore sub-subagents for deep reads).

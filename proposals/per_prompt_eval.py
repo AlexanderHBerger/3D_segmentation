@@ -32,6 +32,7 @@ Usage (GPU required):
 """
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 from typing import List, Tuple
@@ -48,22 +49,48 @@ from model import create_model  # noqa: E402
 
 
 CONFIG_PATH = str(REPO_ROOT / "proposals" / "feasibility_textprompted_config.py")
-DATA_PATH = Path("/ministorage/ahb/data/nnUNet_preprocessed/Dataset018_TextPrompted")
+DATA_PATH = Path(os.environ.get("DATASET_DATA_PATH", "/ministorage/ahb/data/nnUNet_preprocessed/Dataset018_TextPrompted"))
 EMBEDDINGS_PATH = DATA_PATH / "embeddings.pt"
 PROMPTS_DIR = REPO_ROOT / "proposals" / "textprompted_prompts_subset"
 
 # (label, checkpoint_path, case_ids) — case_ids in the order the training loop saw.
 CHECKPOINTS: List[Tuple[str, Path, List[str]]] = [
     (
-        "a' (wnvtqob0, max_samples=1)",
-        REPO_ROOT / "experiments" / "fold_0_wnvtqob0" / "checkpoint.pth",
+        "b'' (sycrmtrc, scratch-B)",
+        REPO_ROOT / "experiments" / "fold_0_sycrmtrc" / "checkpoint.pth",
         [
             "BRATS_Mets_BraTS-MET-00001-000",
+            "BRATS_Mets_BraTS-MET-00002-000",
+            "BRATS_Mets_BraTS-MET-00003-000",
+            "BRATS_Mets_BraTS-MET-00004-000",
+            "BRATS_Mets_BraTS-MET-00006-000",
         ],
     ),
     (
-        "b' (mlkbwwia, max_samples=5)",
-        REPO_ROOT / "experiments" / "fold_0_mlkbwwia" / "checkpoint.pth",
+        "FT (d842zptt, VoxTell + full FT)",
+        REPO_ROOT / "experiments" / "fold_0_d842zptt" / "checkpoint.pth",
+        [
+            "BRATS_Mets_BraTS-MET-00001-000",
+            "BRATS_Mets_BraTS-MET-00002-000",
+            "BRATS_Mets_BraTS-MET-00003-000",
+            "BRATS_Mets_BraTS-MET-00004-000",
+            "BRATS_Mets_BraTS-MET-00006-000",
+        ],
+    ),
+    (
+        "FE (l3tft8qj, VoxTell + freeze_encoder)",
+        REPO_ROOT / "experiments" / "fold_0_l3tft8qj" / "checkpoint.pth",
+        [
+            "BRATS_Mets_BraTS-MET-00001-000",
+            "BRATS_Mets_BraTS-MET-00002-000",
+            "BRATS_Mets_BraTS-MET-00003-000",
+            "BRATS_Mets_BraTS-MET-00004-000",
+            "BRATS_Mets_BraTS-MET-00006-000",
+        ],
+    ),
+    (
+        "LoRA (v8acgetq, VoxTell + freeze + LoRA r=16)",
+        REPO_ROOT / "experiments" / "fold_0_v8acgetq" / "checkpoint.pth",
         [
             "BRATS_Mets_BraTS-MET-00001-000",
             "BRATS_Mets_BraTS-MET-00002-000",
@@ -155,7 +182,29 @@ def evaluate_checkpoint(label: str, checkpoint_path: Path, case_ids: List[str],
     print(f"Checkpoint epoch: {epoch}")
 
     model = create_model(cfg).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+
+    # Detect LoRA checkpoint by probing state_dict key shape: LoRA-decomposed MHA
+    # emits "...self_attn.q_proj.lora_A.weight" keys; vanilla MHA has
+    # "...self_attn.in_proj_weight". If the checkpoint looks LoRA, apply the same
+    # transformer-decoder wrapping as train.py:_apply_lora before strict-loading.
+    sd = checkpoint["model_state_dict"]
+    is_lora_ckpt = any(".lora_A.weight" in k for k in sd.keys())
+    if is_lora_ckpt:
+        from lora import apply_lora_to_transformer
+        # rank/alpha/dropout parsed from the feasibility config's training block
+        lora_rank = getattr(cfg.training, "lora_rank", 16)
+        lora_alpha = getattr(cfg.training, "lora_alpha", 16)
+        lora_dropout = getattr(cfg.training, "lora_dropout", 0.0)
+        apply_lora_to_transformer(
+            model.transformer_decoder,
+            rank=lora_rank,
+            alpha=lora_alpha,
+            dropout=lora_dropout,
+        )
+        model.to(device)
+        print(f"  [LoRA] wrapped transformer_decoder (rank={lora_rank}, alpha={lora_alpha}) before strict load")
+
+    model.load_state_dict(sd, strict=True)
     model.eval()
 
     patch_size = tuple(cfg.data.patch_size)

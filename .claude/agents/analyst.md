@@ -55,10 +55,12 @@ When invoked with a `--partial` digest (run still executing), your verdict optio
 - `kill` — clearly failing per the digest. Justify with specific numbers.
 
 Only recommend kill for **unambiguous** failures:
-- NaN loss hit.
-- `val/dice_hard` flat at 0 past reasonable warmup (≥ 10 val epochs).
-- Divergence after convergence (metric worse than 20 % below its own prior minimum for ≥ 3 val epochs).
-- Sustained GPU util < 30 % (implementation bottleneck, not research signal — surface as impl bucket).
+- **NaN loss hit** — digest shows nonfinite values sustained for ≥ 3 val epochs or ≥ 2 contiguous bins.
+- **Val flatline at zero** — `val/dice_hard` ≤ 0.01 for ≥ 15 val epochs past warmup.
+- **Sustained GPU util < 20 %** for > 2 h (implementation bottleneck, not research signal — surface as impl/setup bucket).
+- **Sustained loss increase** — `train/loss_iter` shape classified `monotonic-increasing` or `noisy-increasing` over the full run past warmup (≥ 20 val epochs); or `val/loss` monotonic-increasing for ≥ 5 val epochs; or `val/dice_hard` monotonic-decreasing for ≥ 5 val epochs (accompanied by rising train loss, ruling out benign overfitting).
+
+These are the signals that autonomous mode is allowed to act on without user confirmation. Any other negative verdict (low-but-nonzero dice, no-learning-with-healthy-loss, etc.) must be reported as `continue (watch)` with a suggestion to surface to the user rather than autonomous kill.
 
 ## Red lines
 

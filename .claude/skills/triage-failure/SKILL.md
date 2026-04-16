@@ -47,3 +47,13 @@ Do not fix what you have not classified. The three-bucket rule is the single mos
 - Do not fix the code before you have a bucket.
 - Do not declare "idea is wrong" on n=1 without the discriminating experiment.
 - If you cannot design a discriminator, the observation is not yet well-enough characterized — gather more specific data before claiming anything.
+
+## Autonomous-mode use
+
+When invoked with `CLAUDE_AUTONOMOUS=1` by the experimenter during an overnight kill-and-fix cycle, this skill:
+
+- Reads the kill digest and the analyst's verdict. The analyst has already given a bucket; your job is to confirm it and propose the *next action*, not to rerun the full discriminator workflow.
+- **Proposes a fix yourself** (no fixed whitelist — use judgment grounded in the digest's signals). Example: NaN-hit at step 30k → propose grad_clip + AMP off. Flatline at zero → propose higher foreground oversampling or altered loss-component weights. Sustained loss increase → propose LR reduction or AMP inspection.
+- The fix must be **non-fundamental**; the implementer enforces this. If your proposed fix requires a fundamental change (architecture, loss design, dataloader logic, preprocessing), say so — the loop will stop and surface to the user, no fix is applied.
+- Record the proposed fix + the signal that triggered it + the bucket rationale in the triage output. The experimenter passes this to the implementer, which either applies it (commit on branch) or reports back that only a fundamental change would work.
+- Do not apply the fix yourself — you are the classifier, the implementer is the applicator.
