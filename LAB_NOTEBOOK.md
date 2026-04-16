@@ -68,12 +68,6 @@ Template:
 - **Would revisit if**: condition that would make it worth retrying.
 -->
 
-### feasibility-overfit job_908660 (config-setup bug)  [2026-04-13]
-- **What we tried**: autonomous submission of feasibility overfit sub-experiment (a) via proposals/feasibility_config.py.
-- **What happened**: job crashed at init in 14s with `ValueError: Unknown loss function: combined` from losses.get_loss_function; no training steps ran.
-- **Bucket**: setup; the config snapshot inherited the repo default `training.loss_function="combined"` which has no branch in `losses.py` (registry only recognises dice/ce/focal/dice_ce/dice_plus_plus[+_ce]/tversky[_ce]/combined_topograph/combined_betti).
-- **Would revisit if**: feasibility_config.py pins a valid registry key (proposed: `dice_ce`) and re-submits after sanity-check on the new sha.
-
 ### VoxTell-init 4-way (FT / FE / LoRA vs scratch-B) on fold-0 overfit subset  [2026-04-16]
 - **What we tried**: re-run the (b') 5-case × 3-prompt feasibility on ResUNet-B text-prompted with VoxTell pretrained init in three finetune modes (FT/FE/LoRA) plus a matched scratch-B baseline (b''). 200 epochs, seed=42, bs=1, same prompts subset. **n=1 per mode.**
 - **What happened**: all four runs completed. Tail-bin `train/loss_dice`: b''=0.189, FT=0.099, FE=0.069, LoRA=0.088. Per-prompt mean `dice_hard`: b''=0.787, FT=0.817, FE=0.819, LoRA=0.821 (lesion / region / global breakdown in digest). Strict pre-registered thresholds reject all four; analyst verdict **inconclusive** on the underlying question.
