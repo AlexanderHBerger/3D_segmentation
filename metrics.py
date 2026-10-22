@@ -1,603 +1,203 @@
-"""
-Metrics for segmentation evaluation
-"""
-import torch
-from typing import Dict, Tuple
-import torch.nn.functional as F
-from skimage.measure import euler_number
-import cc3d
-import numpy as np
-import time
-from concurrent.futures import ProcessPoolExecutor
+"""Validation metrics: soft and hard Dice, Betti matching error and calibration."""
 import os
+from concurrent.futures import ProcessPoolExecutor
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+BM_DIMS = ("b0", "b1", "b2")
 
 
-def prepare_targets_with_mask(
-    targets: torch.Tensor,
-    num_classes: int,
-    ignore_index: int = -1
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Centralized utility to prepare targets and create valid mask.
-    
-    This function handles the common pattern of:
-    1. Creating a mask for valid voxels (excluding ignore_index)
-    2. Clamping targets to valid range [0, num_classes)
-    
-    Args:
-        targets: (B, H, W, D) - class indices
-        num_classes: Number of classes
-        ignore_index: Index to ignore in target
-    
-    Returns:
-        Tuple of (valid_mask, targets_clamped, num_valid_voxels):
-        - valid_mask: (B, H, W, D) - boolean mask where targets != ignore_index
-        - targets_clamped: (B, H, W, D) - targets clamped to [0, num_classes)
-        - num_valid_voxels: scalar - total number of valid voxels
-    """
-    # Create mask for valid voxels (not ignore_index)
-    valid_mask = targets != ignore_index
-    
-    # Clamp targets to valid range for safety.
-    # For binary mode (num_classes=1), targets are still {0, 1} class indices
-    # (1 output channel with sigmoid, not 1 class), so clamp to [0, 1].
-    clamp_max = max(num_classes, 2) - 1
-    targets_clamped = torch.clamp(targets, 0, clamp_max).long()
-    
-    # Count valid voxels
-    num_valid_voxels = valid_mask.sum()
-    
-    return valid_mask, targets_clamped, num_valid_voxels
+def prepare_targets(targets, num_classes, ignore_index=-1):
+    """(valid mask, targets clamped to the class range)."""
+    valid = targets != ignore_index
+    return valid, torch.clamp(targets, 0, max(num_classes, 2) - 1).long()
 
 
-def dice_coefficient(
-    predictions: torch.Tensor,
-    targets_clamped: torch.Tensor,
-    valid_mask: torch.Tensor,
-    include_background: bool = False,
-    smooth: float = 1e-5
-) -> torch.Tensor:
+def dice_coefficient(logits, targets, valid, smooth=1e-5):
+    """Soft Dice per foreground class, averaged over the batch."""
+    n_cls = logits.shape[1]
+    probs = F.softmax(logits, dim=1)
+    one_hot = F.one_hot(targets, num_classes=n_cls).movedim(-1, 1).float()
+    v = valid.unsqueeze(1).expand_as(probs)
+    probs, one_hot = (probs * v).reshape(probs.shape[0], n_cls, -1), (one_hot * v).reshape(probs.shape[0], n_cls, -1)
+    inter = (probs * one_hot).sum(2)
+    union = probs.sum(2) + one_hot.sum(2)
+    return ((2.0 * inter + smooth) / (union + smooth))[:, 1:].mean(0)
+
+
+def hard_dice_coefficient(pred, targets, valid, smooth=1e-5):
+    """Dice of the argmax prediction per foreground class, averaged over the batch."""
+    n_cls = max(targets.max().item() + 1, pred.max().item() + 1, 2)
+    p = F.one_hot(pred, num_classes=n_cls).movedim(-1, 1).float()
+    t = F.one_hot(targets.long(), num_classes=n_cls).movedim(-1, 1).float()
+    v = valid.unsqueeze(1).expand_as(p)
+    p, t = (p * v).reshape(p.shape[0], n_cls, -1), (t * v).reshape(t.shape[0], n_cls, -1)
+    inter = (p * t).sum(2)
+    union = p.sum(2) + t.sum(2)
+    return ((2.0 * inter + smooth) / (union + smooth))[:, 1:].mean(0)
+
+
+# --------------------------------------------------------------- Betti matching error
+
+def _count(result, attrs, n_dims):
+    counts = [0] * n_dims
+    for attr in attrs:
+        for d in range(n_dims):
+            counts[d] += len(np.asarray(getattr(result, attr)[d]))
+    return counts
+
+
+def betti_matching_error(pred: np.ndarray, gt: np.ndarray) -> dict:
+    """Betti matching between two binary masks (2D or 3D), computed on the sparse cubical
+    complex, which gives the same matching as the dense one for binary inputs.
+
+    bm_error is the number of features of either mask without a matched partner. Bars
+    that are still alive when the background enters (`essential`) count as features.
     """
-    Calculate Dice coefficient (soft Dice, sample-wise) for 3D segmentation.
-    Computes Dice per sample and averages over the batch.
-    
-    Args:
-        predictions: (B, C, H, W, D) - logits where C is num_classes
-        targets_clamped: (B, H, W, D) - class indices clamped to [0, num_classes)
-        valid_mask: (B, H, W, D) - boolean mask for valid voxels
-        include_background: Whether to include background class in calculation
-        smooth: Smoothing factor to avoid division by zero
-    
-    Returns:
-        Dice coefficient per class (averaged over batch, excluding background if include_background=False)
-        
-    Raises:
-        ValueError: If input dimensions are not 3D or shapes don't match expected format
-    """
-    # Validate input dimensions - must be 3D
-    if predictions.dim() != 5:
-        raise ValueError(
-            f"Expected 5D predictions tensor (B, C, H, W, D), got shape {predictions.shape}. "
-            f"Predictions must be logits with shape (batch, num_classes, height, width, depth)."
-        )
-    
-    if targets_clamped.dim() != 4:
-        raise ValueError(
-            f"Expected 4D targets tensor (B, H, W, D), got shape {targets_clamped.shape}. "
-            f"Targets must be class indices with shape (batch, height, width, depth)."
-        )
-    
-    # Validate spatial dimensions match
-    if predictions.shape[0] != targets_clamped.shape[0]:
-        raise ValueError(f"Batch size mismatch: predictions {predictions.shape[0]} vs targets {targets_clamped.shape[0]}")
-    
-    if predictions.shape[2:] != targets_clamped.shape[1:]:
-        raise ValueError(f"Spatial dimensions mismatch: predictions {predictions.shape[2:]} vs targets {targets_clamped.shape[1:]}")
-    
-    # Extract number of classes and convert predictions to probabilities
-    num_classes = predictions.shape[1]
-    if num_classes == 1:
-        # Binary sigmoid mode (e.g., text-prompted segmentation)
-        probs = torch.sigmoid(predictions)  # (B, 1, H, W, D)
-        targets_one_hot = targets_clamped.unsqueeze(1).float()  # (B, 1, H, W, D)
+    from sparse_bm import sparse_matching
+
+    res = sparse_matching(pred.astype(np.float64), gt.astype(np.float64), tau_mask=0.5)[0]
+    n = pred.ndim
+    matched = _count(res, ("input1_matched_birth_coordinates",
+                           "input1_matched_essential_birth_coordinates"), n)
+    unm_pred = _count(res, ("input1_unmatched_birth_coordinates",
+                            "input1_unmatched_essential_birth_coordinates"), n)
+    unm_gt = _count(res, ("input2_unmatched_birth_coordinates",
+                          "input2_unmatched_essential_birth_coordinates"), n)
+    out = {"bm_error": sum(unm_pred) + sum(unm_gt)}
+    for d, name in enumerate(BM_DIMS[:n]):
+        out[f"bm_matched_{name}"] = matched[d]
+        out[f"bm_unmatched_pred_{name}"] = unm_pred[d]
+        out[f"bm_unmatched_gt_{name}"] = unm_gt[d]
+    return out
+
+
+def _bm_one(args):
+    return betti_matching_error(*args)
+
+
+def batch_betti_matching_error(pred, gt, valid, num_workers=None) -> dict:
+    """Mean Betti matching error over a batch of label maps (foreground = label > 0)."""
+    gt_bin = torch.logical_and(gt > 0, valid).cpu().numpy()
+    pred_bin = torch.logical_and(pred > 0, valid).cpu().numpy()
+    args = [(pred_bin[b], gt_bin[b]) for b in range(len(gt_bin))]
+    if len(args) > 1:
+        with ProcessPoolExecutor(max_workers=num_workers or min(len(args), os.cpu_count())) as ex:
+            rows = list(ex.map(_bm_one, args))
     else:
-        probs = F.softmax(predictions, dim=1)
-        # Convert targets to one-hot: (B, H, W, D) -> (B, C, H, W, D)
-        targets_one_hot = F.one_hot(targets_clamped.long(), num_classes=num_classes)
-        targets_one_hot = targets_one_hot.permute(0, 4, 1, 2, 3).float()
-    
-    # Apply valid mask
-    valid_mask_expanded = valid_mask.unsqueeze(1).expand_as(probs)
-    probs = probs * valid_mask_expanded
-    targets_one_hot = targets_one_hot * valid_mask_expanded
-    
-    # Calculate Dice per sample
-    # Flatten spatial dims: (B, C, H, W, D) -> (B, C, N)
-    probs_flat = probs.reshape(probs.shape[0], num_classes, -1)
-    target_flat = targets_one_hot.reshape(targets_one_hot.shape[0], num_classes, -1)
-    
-    intersection = (probs_flat * target_flat).sum(dim=2)  # (B, C)
-    union = probs_flat.sum(dim=2) + target_flat.sum(dim=2)  # (B, C)
-    
-    dice_scores = (2.0 * intersection + smooth) / (union + smooth)  # (B, C)
-    
-    # Select classes (exclude background if needed)
-    # For binary mode (num_classes=1), the single channel IS foreground — always include it
-    if num_classes == 1:
-        start_idx = 0
-    else:
-        start_idx = 0 if include_background else 1
-    dice_scores = dice_scores[:, start_idx:]  # (B, C_subset)
-
-    # Return mean over batch
-    return dice_scores.mean(dim=0)
+        rows = [_bm_one(a) for a in args]
+    return {k: sum(r[k] for r in rows) / len(rows) for k in rows[0]}
 
 
-def hard_dice_coefficient(
-    pred_indices: torch.Tensor,
-    targets_clamped: torch.Tensor,
-    valid_mask: torch.Tensor,
-    include_background: bool = False,
-    smooth: float = 1e-5
-) -> torch.Tensor:
-    """
-    Calculate Hard Dice coefficient (sample-wise) for 3D segmentation.
-    Computes Hard Dice (using argmax) averaged over the batch.
-    
-    Args:
-        pred_indices: (B, H, W, D) - class indices from argmax of predictions
-        targets_clamped: (B, H, W, D) - class indices clamped to [0, num_classes)
-        valid_mask: (B, H, W, D) - boolean mask for valid voxels
-        include_background: Whether to include background class in calculation
-        smooth: Smoothing factor to avoid division by zero
-    
-    Returns:
-        Dice coefficient per class (averaged over batch)
-    """
-    num_classes = max(targets_clamped.max().item() + 1, pred_indices.max().item() + 1, 2)
+# -------------------------------------------------------------------- calibration
 
-    # Convert to one-hot
-    pred_one_hot = F.one_hot(pred_indices, num_classes=num_classes).permute(0, 4, 1, 2, 3).float()
-    targets_one_hot = F.one_hot(targets_clamped.long(), num_classes=num_classes).permute(0, 4, 1, 2, 3).float()
-    
-    # Apply valid mask
-    valid_mask_expanded = valid_mask.unsqueeze(1).expand_as(pred_one_hot)
-    pred_one_hot = pred_one_hot * valid_mask_expanded
-    targets_one_hot = targets_one_hot * valid_mask_expanded
-    
-    # Calculate Dice per sample
-    # Flatten spatial dims: (B, C, H, W, D) -> (B, C, N)
-    pred_flat = pred_one_hot.reshape(pred_one_hot.shape[0], num_classes, -1)
-    target_flat = targets_one_hot.reshape(targets_one_hot.shape[0], num_classes, -1)
-    
-    intersection = (pred_flat * target_flat).sum(dim=2) # (B, C)
-    union = pred_flat.sum(dim=2) + target_flat.sum(dim=2) # (B, C)
-    
-    dice_scores = (2.0 * intersection + smooth) / (union + smooth) # (B, C)
-    
-    # Select classes
-    start_idx = 0 if include_background else 1
-    dice_scores = dice_scores[:, start_idx:] # (B, C_subset)
-    
-    # Return mean over batch
-    return dice_scores.mean(dim=0)
+def calibration_errors(confidences, accuracies, num_bins=15):
+    """(ECE, MCE) over equal-width confidence bins."""
+    edges = torch.linspace(0, 1, num_bins + 1, device=confidences.device)
+    ece = torch.zeros(1, device=confidences.device)
+    mce = torch.zeros(1, device=confidences.device)
+    for i in range(num_bins):
+        in_bin = (confidences > edges[i]) & (confidences <= edges[i + 1])
+        prop = in_bin.float().mean()
+        if prop.item() > 0:
+            gap = torch.abs(confidences[in_bin].mean() - accuracies[in_bin].mean())
+            ece += gap * prop
+            mce = torch.max(mce, gap)
+    return ece.item(), mce.item()
 
+
+def calibration_metrics(logits, targets, targets_clamped, valid, num_bins=15, ignore_index=-1):
+    """ECE, MCE, NLL and Brier score per sample over the valid voxels, averaged."""
+    rows = []
+    with torch.no_grad():
+        probs = torch.softmax(logits, dim=1)
+        n_cls = logits.shape[1]
+        for b in range(logits.shape[0]):
+            m = valid[b].reshape(-1)
+            if m.sum() == 0:
+                continue
+            p = probs[b].movedim(0, -1).reshape(-1, n_cls)[m]
+            t = targets_clamped[b].reshape(-1)[m]
+            conf, pred = p.max(dim=1)
+            ece, mce = calibration_errors(conf, pred.eq(t).float(), num_bins)
+            nll = F.cross_entropy(logits[b:b + 1], targets[b:b + 1], ignore_index=ignore_index).item()
+            brier = ((p - F.one_hot(t, n_cls).float()) ** 2).sum().item() / int(m.sum())
+            rows.append((ece, mce, nll, brier))
+    if not rows:
+        return {"ece": 0.0, "mce": 0.0, "nll": 0.0, "brier_score": 0.0}
+    return dict(zip(("ece", "mce", "nll", "brier_score"), np.mean(rows, axis=0).tolist()))
+
+
+# ------------------------------------------------------------------------ aggregation
 
 class MetricsCalculator:
-    """Class to calculate and accumulate metrics during training/validation."""
+    """Accumulates validation metrics, weighting every sample equally.
 
-    def __init__(self, num_classes: int = 2, include_background: bool = False, ignore_index: int = -1, compute_calibration: bool = False, compute_topological: bool = True, num_bins: int = 15):
-        self.num_classes = num_classes
-        self.include_background = include_background
+    The Betti matching error can be restricted to every `betti_sample_stride`-th sample
+    and at most `betti_max_samples` samples, for datasets with many validation patches.
+    """
+
+    def __init__(self, ignore_index=-1, compute_betti_matching=False, compute_calibration=False,
+                 betti_num_workers=None, betti_max_samples=None, betti_sample_stride=1):
         self.ignore_index = ignore_index
+        self.compute_betti_matching = compute_betti_matching
         self.compute_calibration = compute_calibration
-        self.compute_topological = compute_topological
-        self.num_bins = num_bins
+        self.betti_num_workers = betti_num_workers
+        self.betti_max_samples = betti_max_samples
+        self.betti_sample_stride = max(1, int(betti_sample_stride or 1))
         self.reset()
 
     def reset(self):
-        """Reset accumulated metrics (called at start of each validation epoch)"""
-        self.dice_scores = []
-        self.hard_dice_scores = []
-        self.total_samples = 0
+        self.dice, self.hard_dice, self.counts = [], [], []
+        self.topo, self.topo_counts = [], []
+        self.calib, self.calib_counts = [], []
+        self._seen = self._scored = 0
 
-        # Calibration metrics accumulators
+    def update(self, logits, targets) -> dict:
+        b = logits.shape[0]
+        valid, tc = prepare_targets(targets, logits.shape[1], self.ignore_index)
+        pred = logits.argmax(dim=1)
+        dice = dice_coefficient(logits, tc, valid)
+        hard = hard_dice_coefficient(pred, tc, valid)
+        self.dice.append(dice)
+        self.hard_dice.append(hard)
+        self.counts.append(b)
+        out = {"dice_mean": dice.mean().item(), "dice_hard": hard.mean().item()}
+
+        if self.compute_betti_matching:
+            first, self._seen = self._seen, self._seen + b
+            idx = []
+            for i in range(b):
+                if (first + i) % self.betti_sample_stride:
+                    continue
+                if self.betti_max_samples is not None and self._scored >= self.betti_max_samples:
+                    break
+                idx.append(i)
+                self._scored += 1
+            if idx:
+                bm = batch_betti_matching_error(pred[idx], tc[idx], valid[idx], self.betti_num_workers)
+                self.topo.append(bm)
+                self.topo_counts.append(len(idx))
+                out.update(bm)
+
         if self.compute_calibration:
-            self.ece_scores = []
-            self.mce_scores = []
-            self.nll_scores = []
-            self.brier_scores = []
+            cal = calibration_metrics(logits, targets, tc, valid, ignore_index=self.ignore_index)
+            self.calib.append(cal)
+            self.calib_counts.append(b)
+            out.update(cal)
+        return out
 
-        # Topological metrics accumulators
-        self.topo_metrics = []
-
-    def update(self, predictions: torch.Tensor, targets: torch.Tensor) -> Dict[str, float]:
-        """
-        Update metrics with new batch.
-
-        Args:
-            predictions: (B, C, H, W, D) - logits
-            targets: (B, H, W, D) - class indices
-
-        Returns:
-            Dictionary of metrics for the current batch
-        """
-        batch_size = predictions.shape[0]
-        self.total_samples += batch_size
-        num_classes = predictions.shape[1]
-
-        # Perform masking once here (centralized)
-        valid_mask, targets_clamped, num_valid_voxels = prepare_targets_with_mask(
-            targets, num_classes, self.ignore_index
-        )
-
-        # calculate argmax predictions
-        if num_classes == 1:
-            argmax_preds = (torch.sigmoid(predictions[:, 0]) > 0.5).long()
-        else:
-            argmax_preds = predictions.argmax(dim=1)
-
-        # Calculate dice metric (pass mask info)
-        dice = dice_coefficient(
-            predictions, targets_clamped, valid_mask,
-            include_background=self.include_background,
-            smooth=1e-5
-        )
-
-        # Accumulate dice scores
-        self.dice_scores.append(dice)
-
-        # Calculate hard dice
-        hard_dice = hard_dice_coefficient(
-            argmax_preds, targets_clamped, valid_mask,
-            include_background=self.include_background,
-            smooth=1e-5
-        )
-        self.hard_dice_scores.append(hard_dice)
-
-        batch_metrics = {
-            'dice_mean': dice.mean().item(),
-            'dice_hard': hard_dice.mean().item()
-        }
-
-        # Betti number metrics
-        if self.compute_topological:
-            topological_errors = compute_topological_errors(
-                targets_clamped, argmax_preds, valid_mask
-            )
-            self.topo_metrics.append(topological_errors)
-            batch_metrics.update(topological_errors)
-
-        # Calculate calibration metrics if enabled (pass mask info)
-        if self.compute_calibration:
-            cal_metrics = compute_calibration_metrics(
-                predictions, targets, targets_clamped, valid_mask, num_valid_voxels,
-                num_bins=self.num_bins, ignore_index=self.ignore_index
-            )
-            self.ece_scores.append(cal_metrics['ece'])
-            self.mce_scores.append(cal_metrics['mce'])
-            self.nll_scores.append(cal_metrics['nll'])
-            self.brier_scores.append(cal_metrics['brier_score'])
-
-            batch_metrics.update(cal_metrics)
-
-        return batch_metrics
-
-    def compute(self) -> Dict[str, float]:
-        """Compute final epoch-level metrics."""
-        if not self.dice_scores:
+    def compute(self) -> dict:
+        if not self.dice:
             return {}
-
-        # Stack and average dice
-        dice_mean = torch.stack(self.dice_scores).mean(dim=0)
-        hard_dice_mean = torch.stack(self.hard_dice_scores).mean(dim=0)
-
-        results = {
-            'dice_mean': dice_mean.mean().item(),
-            'dice_hard': hard_dice_mean.mean().item(),
-        }
-
-        # Add calibration metrics if computed
-        if self.compute_calibration and self.ece_scores:
-            results['ece'] = sum(self.ece_scores) / len(self.ece_scores)
-            results['mce'] = sum(self.mce_scores) / len(self.mce_scores)
-            results['nll'] = sum(self.nll_scores) / len(self.nll_scores)
-            results['brier_score'] = sum(self.brier_scores) / len(self.brier_scores)
-
-        # Add topological metrics if computed
-        if self.topo_metrics and len(self.topo_metrics) > 0:
-            for key in self.topo_metrics[0].keys():
-                results[key] = sum(m[key] for m in self.topo_metrics) / len(self.topo_metrics)
-
-        return results
-    
-    def get_main_metric(self) -> float:
-        """Get main metric for model selection (mean Dice)"""
-        if not self.dice_scores:
-            return 0.0
-        
-        dice_mean = torch.stack(self.dice_scores).mean(dim=0)
-        return dice_mean.mean().item()
-
-def get_betti_numbers(image):
-    """Returns [b0, b1, b2] for a binary image using Euler method."""
-    padded_image = np.pad(image, 1, mode='constant', constant_values=0)
-    chi = int(euler_number(padded_image, connectivity=3)) # 26-connectivity
-    b0 = int(cc3d.connected_components(padded_image, connectivity=26, binary_image=True).max())
-    
-    # Invert for b2 (background components), using dual connectivity (6-conn)
-    b2 = int(cc3d.connected_components(1 - padded_image, connectivity=6, binary_image=True).max()) - 1
-    
-    b1 = b0 + b2 - chi
-    return np.array([b0, b1, b2], dtype=np.int64)
-
-def _compute_sample_topological_metrics(args):
-    """Helper function for parallel processing of single sample."""
-    gt_sample, pred_sample = args
-    
-    # Get Betti counts
-    b_gt = get_betti_numbers(gt_sample)
-    b_pred = get_betti_numbers(pred_sample)
-    
-    return {
-        "b0_pred": b_pred[0],
-        "b1_pred": b_pred[1],
-        "b2_pred": b_pred[2],
-        "b0_gt": b_gt[0],
-        "b1_gt": b_gt[1],
-        "b2_gt": b_gt[2],
-    }
-
-def compute_topological_errors(
-    gt: torch.Tensor, 
-    pred: torch.Tensor,
-    valid_mask: torch.Tensor,
-    use_parallel: bool = True,
-    num_workers: int = None
-):
-    """
-    Compute topological errors for a batch of 3D segmentations.
-    
-    Args:
-        gt: (B, H, W, D) - ground truth class indices
-        pred: (B, H, W, D) - predicted class indices
-        valid_mask: (B, H, W, D) - boolean mask for valid voxels
-        use_parallel: Whether to use parallel processing across batch
-        num_workers: Number of parallel workers (default: cpu_count)
-        
-    Returns:
-        Dictionary of topological metrics averaged over the batch
-    """
-    # binarize
-    gt_bin = (gt > 0)
-    pred_bin = (pred > 0)
-
-    # mask out invalid regions
-    gt_bin = torch.logical_and(gt_bin, valid_mask)
-    pred_bin = torch.logical_and(pred_bin, valid_mask)
-
-    # Convert to numpy
-    gt_bin = gt_bin.cpu().numpy()
-    pred_bin = pred_bin.cpu().numpy()
-    
-    batch_size = gt.shape[0]
-    
-    # Prepare arguments for each sample
-    sample_args = [
-        (gt_bin[b], pred_bin[b])
-        for b in range(batch_size)
-    ]
-    
-    # Compute metrics (parallel or sequential)
-    if use_parallel and batch_size > 1:
-        max_workers = num_workers if num_workers else min(batch_size, os.cpu_count())
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            metrics_list = list(executor.map(_compute_sample_topological_metrics, sample_args))
-    else:
-        metrics_list = [_compute_sample_topological_metrics(args) for args in sample_args]
-    
-    # Average metrics across batch
-    averaged_metrics = {}
-    if metrics_list:
-        for key in metrics_list[0].keys():
-            # Handle NaN values by counting them as 1
-            averaged_metrics[key] = sum(
-                1.0 if (isinstance(m[key], (float, np.floating)) and np.isnan(m[key])) else m[key] 
-                for m in metrics_list
-            ) / len(metrics_list)
-    
-    return averaged_metrics
-
-def compute_calibration_metrics(
-    logits: torch.Tensor, 
-    targets: torch.Tensor,
-    targets_clamped: torch.Tensor,
-    valid_mask: torch.Tensor,
-    num_valid_voxels: torch.Tensor,
-    num_bins: int = 15,
-    ignore_index: int = -1
-):
-    """
-    Compute calibration metrics for 3D segmentation (sample-wise, then averaged).
-    
-    - Expected Calibration Error (ECE)
-    - Maximum Calibration Error (MCE)
-    - Negative Log-Likelihood (NLL)
-    - Brier Score
-
-    Args:
-        logits (torch.Tensor): Model logits of shape (B, C, H, W, D) where C is num_classes
-        targets (torch.Tensor): Original ground truth class indices (may contain ignore_index)
-        targets_clamped (torch.Tensor): Clamped targets to [0, num_classes)
-        valid_mask (torch.Tensor): Boolean mask for valid voxels
-        num_valid_voxels (torch.Tensor): Total count of valid voxels (unused, kept for API compatibility)
-        num_bins (int): Number of bins for ECE/MCE computation
-        ignore_index (int): Index to ignore in target (used for NLL computation)
-
-    Returns:
-        dict: Dictionary containing calibration metrics (averaged over samples)
-        
-    Raises:
-        ValueError: If input dimensions are not 3D or shapes don't match expected format
-    """
-    
-    # Validate input dimensions - must be 3D
-    if logits.dim() != 5:
-        raise ValueError(f"Expected 5D logits tensor (B, C, H, W, D), got shape {logits.shape}")
-    
-    if targets.dim() != 4:
-        raise ValueError(f"Expected 4D targets tensor (B, H, W, D), got shape {targets.shape}")
-    
-    # Validate spatial dimensions match
-    if logits.shape[0] != targets.shape[0]:
-        raise ValueError(f"Batch size mismatch: logits {logits.shape[0]} vs targets {targets.shape[0]}")
-    
-    if logits.shape[2:] != targets.shape[1:]:
-        raise ValueError(f"Spatial dimensions mismatch: logits {logits.shape[2:]} vs targets {targets.shape[1:]}")
-
-    with torch.no_grad():
-        batch_size = logits.shape[0]
-        num_classes = logits.shape[1]
-        
-        # Convert logits to probabilities
-        probs = torch.softmax(logits, dim=1)
-        
-        # Storage for per-sample metrics
-        ece_samples = []
-        mce_samples = []
-        nll_samples = []
-        brier_samples = []
-
-        # Compute metrics per sample
-        for b in range(batch_size):
-            # Get single sample tensors
-            probs_b = probs[b]  # (C, H, W, D)
-            targets_b = targets[b]  # (H, W, D)
-            targets_clamped_b = targets_clamped[b]  # (H, W, D)
-            valid_mask_b = valid_mask[b]  # (H, W, D)
-            
-            # Flatten spatial dimensions for per-voxel metrics
-            # (C, H, W, D) -> (H*W*D, C)
-            probs_flat = probs_b.permute(1, 2, 3, 0).reshape(-1, num_classes)
-            targets_flat = targets_clamped_b.reshape(-1)
-            valid_mask_flat = valid_mask_b.reshape(-1)
-            
-            # Filter to only valid voxels
-            probs_valid = probs_flat[valid_mask_flat]
-            targets_valid = targets_flat[valid_mask_flat]
-            num_valid = valid_mask_flat.sum()
-            
-            # Skip sample if no valid voxels
-            if num_valid == 0:
-                continue
-
-            # Get predicted class and confidence
-            confidences, predictions = torch.max(probs_valid, dim=1)
-            accuracies = predictions.eq(targets_valid).float()
-
-            # 1. Expected Calibration Error (ECE)
-            ece = compute_ece(confidences, accuracies, num_bins)
-            ece_samples.append(ece.item())
-
-            # 2. Maximum Calibration Error (MCE)
-            mce = compute_mce(confidences, accuracies, num_bins)
-            mce_samples.append(mce.item())
-
-            # 3. Negative Log-Likelihood (NLL) - per sample
-            logits_b = logits[b:b+1]  # Keep batch dim: (1, C, H, W, D)
-            targets_b_orig = targets[b:b+1]  # Keep batch dim: (1, H, W, D)
-            nll = F.cross_entropy(logits_b, targets_b_orig, reduction='mean', ignore_index=ignore_index)
-            nll_samples.append(nll.item())
-
-            # 4. Brier Score per sample
-            # Convert targets to one-hot: (H, W, D) -> (C, H, W, D)
-            targets_onehot_b = F.one_hot(targets_clamped_b.long(), num_classes=num_classes)
-            targets_onehot_b = targets_onehot_b.permute(3, 0, 1, 2).float()  # (C, H, W, D)
-            
-            # Apply valid mask
-            valid_mask_expanded = valid_mask_b.unsqueeze(0).expand_as(probs_b)
-            probs_masked = probs_b * valid_mask_expanded
-            targets_onehot_masked = targets_onehot_b * valid_mask_expanded
-            
-            # Compute Brier score only over valid voxels
-            brier_score = ((probs_masked - targets_onehot_masked) ** 2).sum() / num_valid
-            brier_samples.append(brier_score.item())
-
-        # Average across samples (handle empty case)
-        if len(ece_samples) == 0:
-            return {
-                'ece': 0.0,
-                'mce': 0.0,
-                'nll': 0.0,
-                'brier_score': 0.0
-            }
-        
-        return {
-            'ece': sum(ece_samples) / len(ece_samples),
-            'mce': sum(mce_samples) / len(mce_samples),
-            'nll': sum(nll_samples) / len(nll_samples),
-            'brier_score': sum(brier_samples) / len(brier_samples)
-        }
-
-
-def compute_ece(confidences: torch.Tensor, accuracies: torch.Tensor, num_bins: int = 15):
-    """
-    Compute Expected Calibration Error (ECE).
-    
-    ECE measures the difference between predicted confidence and actual accuracy,
-    averaged across confidence bins weighted by the proportion of samples in each bin.
-
-    Args:
-        confidences (torch.Tensor): Predicted confidences (max probabilities) of shape (N,)
-        accuracies (torch.Tensor): Binary accuracy (1 if correct, 0 if wrong) of shape (N,)
-        num_bins (int): Number of bins to discretize confidence scores
-
-    Returns:
-        torch.Tensor: ECE value (scalar)
-    """
-    bin_boundaries = torch.linspace(0, 1, num_bins + 1, device=confidences.device)
-    ece = torch.zeros(1, device=confidences.device)
-
-    for i in range(num_bins):
-        # Find samples in this confidence bin
-        in_bin = (confidences > bin_boundaries[i]) & (confidences <= bin_boundaries[i + 1])
-        prop_in_bin = in_bin.float().mean()
-
-        if prop_in_bin.item() > 0:
-            accuracy_in_bin = accuracies[in_bin].mean()
-            avg_confidence_in_bin = confidences[in_bin].mean()
-            ece += torch.abs(avg_confidence_in_bin - accuracy_in_bin) * prop_in_bin
-
-    return ece
-
-
-def compute_mce(confidences: torch.Tensor, accuracies: torch.Tensor, num_bins: int = 15):
-    """
-    Compute Maximum Calibration Error (MCE).
-    
-    MCE measures the worst-case calibration error across all confidence bins,
-    representing the maximum deviation between confidence and accuracy.
-
-    Args:
-        confidences (torch.Tensor): Predicted confidences (max probabilities) of shape (N,)
-        accuracies (torch.Tensor): Binary accuracy (1 if correct, 0 if wrong) of shape (N,)
-        num_bins (int): Number of bins to discretize confidence scores
-
-    Returns:
-        torch.Tensor: MCE value (scalar)
-    """
-    bin_boundaries = torch.linspace(0, 1, num_bins + 1, device=confidences.device)
-    mce = torch.zeros(1, device=confidences.device)
-
-    for i in range(num_bins):
-        # Find samples in this confidence bin
-        in_bin = (confidences > bin_boundaries[i]) & (confidences <= bin_boundaries[i + 1])
-        prop_in_bin = in_bin.float().mean()
-
-        if prop_in_bin.item() > 0:
-            accuracy_in_bin = accuracies[in_bin].mean()
-            avg_confidence_in_bin = confidences[in_bin].mean()
-            calibration_error = torch.abs(avg_confidence_in_bin - accuracy_in_bin)
-            mce = torch.max(mce, calibration_error)
-
-    return mce
+        w = torch.tensor(self.counts, dtype=self.dice[0].dtype, device=self.dice[0].device)
+        w = (w / w.sum()).view(-1, 1)
+        out = {"dice_mean": (torch.stack(self.dice) * w).sum(0).mean().item(),
+               "dice_hard": (torch.stack(self.hard_dice) * w).sum(0).mean().item()}
+        for rows, counts in ((self.topo, self.topo_counts), (self.calib, self.calib_counts)):
+            if rows:
+                n = sum(counts)
+                out.update({k: sum(r[k] * c for r, c in zip(rows, counts)) / n for k in rows[0]})
+        return out
