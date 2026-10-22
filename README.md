@@ -1,5 +1,7 @@
 # 3D segmentation
 
+**Branch `topology`**: the experiments of the sparseBM paper are described in [README_sparseBM.md](README_sparseBM.md).
+
 Training of 2D and 3D segmentation networks following the nnU-Net recipe: patch-based
 training on preprocessed data, nnU-Net augmentations, SGD with polynomial learning-rate
 decay, a fixed number of iterations per epoch, and sliding-window inference.

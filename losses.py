@@ -263,8 +263,11 @@ LOSSES = {
 
 def get_loss_function(config) -> nn.Module:
     """LOSSES[training.loss_function](**training.loss_kwargs) on top of Dice + CE."""
+    from baselines.losses import BASELINE_LOSSES
+
+    losses = {**LOSSES, **BASELINE_LOSSES}
     t = config.training
-    if t.loss_function not in LOSSES:
-        raise ValueError(f"unknown loss {t.loss_function!r}; available: {sorted(LOSSES)}")
-    return LOSSES[t.loss_function](dice_weight=t.dice_weight, ce_weight=t.ce_weight,
+    if t.loss_function not in losses:
+        raise ValueError(f"unknown loss {t.loss_function!r}; available: {sorted(losses)}")
+    return losses[t.loss_function](dice_weight=t.dice_weight, ce_weight=t.ce_weight,
                                    ignore_index=t.ignore_index, **t.loss_kwargs)
